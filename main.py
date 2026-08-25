@@ -56,15 +56,15 @@ def contains_banned_word(text: str) -> bool:
 SPAM_LIMIT = 5
 SPAM_SECONDS = 5
 TIMEOUT_ROLE_NAME = "Timed Out"
-TIMEOUT_CHANNEL_ID = 123456789012345678   # <-- replace with a channel timed-out users CAN see but not talk in
+# TIMEOUT_CHANNEL_ID, WELCOME_CHANNEL_ID, GOODBYE_CHANNEL_ID, MOD_LOG_CHANNEL_ID, and
+# LEVEL_UP_CHANNEL_ID used to be hardcoded here — now they're configured PER SERVER using
+# Discord commands (!setwelcomechannel, !setgoodbyechannel, etc — see GUILD SETTINGS section
+# below), since a single hardcoded channel ID breaks the moment the bot is in more than one
+# server. No editing needed here anymore for those.
 
 # --- Owner lock: bot only works in servers where the owner is actually a member ---
 REQUIRE_OWNER_PRESENT = True     # if True, the bot goes completely inert in any server you're not in
 AUTO_LEAVE_IF_NO_OWNER = True   # bot automatically leaves servers where its owner isn't present
-
-WELCOME_CHANNEL_ID = 123456789012345678   # <-- replace with your channel ID
-GOODBYE_CHANNEL_ID = 123456789012345678   # <-- replace with your channel ID
-MOD_LOG_CHANNEL_ID = 123456789012345678   # <-- replace with a private mod-only channel ID
 
 # --- Anti-raid ---
 RAID_JOIN_THRESHOLD = 6        # if this many members join within...
@@ -75,7 +75,17 @@ AUTO_LOCKDOWN_ON_RAID = True   # if True, automatically locks all channels when 
 
 XP_PER_MESSAGE = 15
 XP_COOLDOWN_SECONDS = 60
-LEVEL_UP_CHANNEL_ID = None
+# LEVEL_UP_CHANNEL_ID removed — level-up announcements now default to wherever the message
+# was sent, or a per-server configured channel (!setlevelupchannel).
+
+# Level-up role rewards: at these levels, the member automatically gets a role with this
+# EXACT name (the role must already exist in that server — create it manually first).
+# This applies the same way in every server the bot is in — role names must match.
+LEVEL_ROLE_REWARDS = {
+    5: "Active Member",
+    10: "Regular",
+    20: "Veteran",
+}
 
 BOT_NAME = "Your Bot's Name"
 BOT_PERSONALITY = (
@@ -92,6 +102,7 @@ ROLES_FILE = "stored_roles.json"
 LEVELS_FILE = "levels.json"
 REACTION_ROLES_FILE = "reaction_roles.json"
 AFK_FILE = "afk.json"
+GUILD_SETTINGS_FILE = "guild_settings.json"
 
 
 def load_json(path):
@@ -112,6 +123,24 @@ levels_data = load_json(LEVELS_FILE)
 reaction_roles = load_json(REACTION_ROLES_FILE)
 # afk.json format: {"user_id": {"activity": str, "since": unix_timestamp}}
 afk_data = load_json(AFK_FILE)
+# guild_settings.json format: {"guild_id": {"welcome_channel": id, "goodbye_channel": id,
+#                                             "mod_log_channel": id, "timeout_channel": id,
+#                                             "level_up_channel": id}}
+guild_settings = load_json(GUILD_SETTINGS_FILE)
+
+
+def get_guild_channel(guild_id, key):
+    """Looks up a configured channel for a specific server (welcome_channel, mod_log_channel, etc).
+    Returns the actual discord.Channel object, or None if that server hasn't set one yet."""
+    settings = guild_settings.get(str(guild_id), {})
+    channel_id = settings.get(key)
+    return bot.get_channel(channel_id) if channel_id else None
+
+
+def set_guild_channel(guild_id, key, channel_id):
+    guild_settings.setdefault(str(guild_id), {})[key] = channel_id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+
 
 spam_tracker = {}
 xp_cooldowns = {}
@@ -190,7 +219,7 @@ async def global_owner_lock(ctx):
 async def mod_log(guild: discord.Guild, action: str, target, moderator, reason: str = "No reason given", color=discord.Color.orange()):
     """Posts a clean embed to the mod-log channel recording who did what to whom and why.
     Also DMs the owner a short version so nothing gets missed."""
-    channel = bot.get_channel(MOD_LOG_CHANNEL_ID)
+    channel = get_guild_channel(guild.id, "mod_log_channel")
     embed = discord.Embed(title=f"🛡️ {action}", color=color, timestamp=datetime.datetime.utcnow())
     embed.add_field(name="Target", value=f"{target} (`{target.id}`)", inline=True)
     embed.add_field(name="Moderator", value=f"{moderator} (`{moderator.id}`)", inline=True)
@@ -245,7 +274,7 @@ async def on_member_join(member):
     if REQUIRE_OWNER_PRESENT and not await owner_in_guild(member.guild):
         return  # bricked — owner isn't in this server
 
-    channel = bot.get_channel(WELCOME_CHANNEL_ID)
+    channel = get_guild_channel(member.guild.id, "welcome_channel")
     if channel:
         embed = discord.Embed(
             title="Welcome! 🎉",
@@ -269,7 +298,7 @@ async def on_member_remove(member):
     if REQUIRE_OWNER_PRESENT and not await owner_in_guild(member.guild):
         return  # bricked — owner isn't in this server
 
-    channel = bot.get_channel(GOODBYE_CHANNEL_ID)
+    channel = get_guild_channel(member.guild.id, "goodbye_channel")
     if channel:
         embed = discord.Embed(
             title="Goodbye 👋",
@@ -393,6 +422,66 @@ async def setnickname(ctx, *, nickname: str):
 
 
 # ============================================================
+# GUILD SETTINGS — every server the bot is in configures its OWN channels for
+# welcome/goodbye/mod-log/timeout/level-up. Needs Manage Server permission to set.
+# ============================================================
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def setwelcomechannel(ctx, channel: discord.TextChannel):
+    """Sets THIS server's welcome message channel. Usage: !setwelcomechannel #welcome"""
+    set_guild_channel(ctx.guild.id, "welcome_channel", channel.id)
+    await ctx.send(embed=discord.Embed(description=f"✅ Welcome messages will now post in {channel.mention}.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def setgoodbyechannel(ctx, channel: discord.TextChannel):
+    """Sets THIS server's goodbye message channel. Usage: !setgoodbyechannel #goodbye"""
+    set_guild_channel(ctx.guild.id, "goodbye_channel", channel.id)
+    await ctx.send(embed=discord.Embed(description=f"✅ Goodbye messages will now post in {channel.mention}.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def setmodlogchannel(ctx, channel: discord.TextChannel):
+    """Sets THIS server's mod-log channel. Usage: !setmodlogchannel #mod-log"""
+    set_guild_channel(ctx.guild.id, "mod_log_channel", channel.id)
+    await ctx.send(embed=discord.Embed(description=f"✅ Mod actions will now log to {channel.mention}.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def settimeoutchannel(ctx, channel: discord.TextChannel):
+    """Sets THIS server's timeout channel (visible to timed-out members, they can't talk in it).
+    Usage: !settimeoutchannel #timeout"""
+    set_guild_channel(ctx.guild.id, "timeout_channel", channel.id)
+    await ctx.send(embed=discord.Embed(description=f"✅ Timed-out members will now only see {channel.mention}.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def setlevelupchannel(ctx, channel: discord.TextChannel):
+    """Sets THIS server's level-up announcement channel. Usage: !setlevelupchannel #levels
+    If never set, level-up messages just post in whichever channel the person was chatting in."""
+    set_guild_channel(ctx.guild.id, "level_up_channel", channel.id)
+    await ctx.send(embed=discord.Embed(description=f"✅ Level-up announcements will now post in {channel.mention}.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+async def showsettings(ctx):
+    """Shows this server's currently configured channels."""
+    settings = guild_settings.get(str(ctx.guild.id), {})
+    embed = discord.Embed(title=f"⚙️ Settings for {ctx.guild.name}", color=discord.Color.blurple())
+    for label, key in [("Welcome channel", "welcome_channel"), ("Goodbye channel", "goodbye_channel"),
+                        ("Mod-log channel", "mod_log_channel"), ("Timeout channel", "timeout_channel"),
+                        ("Level-up channel", "level_up_channel")]:
+        channel_id = settings.get(key)
+        value = f"<#{channel_id}>" if channel_id else "*not set*"
+        embed.add_field(name=label, value=value, inline=False)
+    await ctx.send(embed=embed)
+
+
+# ============================================================
 # MOD LOGGING — catches actions done through Discord's own UI too,
 # not just the bot's commands, by reading the server's audit log.
 # ============================================================
@@ -430,7 +519,7 @@ async def on_guild_channel_create(channel):
     timeout_role = discord.utils.get(channel.guild.roles, name=TIMEOUT_ROLE_NAME)
     if timeout_role is None:
         return
-    timeout_channel = bot.get_channel(TIMEOUT_CHANNEL_ID)
+    timeout_channel = get_guild_channel(channel.guild.id, "timeout_channel")
     try:
         if timeout_channel and channel.id == timeout_channel.id:
             await channel.set_permissions(timeout_role, view_channel=True, send_messages=False, speak=False, add_reactions=False)
@@ -647,10 +736,23 @@ async def add_xp(message):
         user_data["level"] += 1
         save_json(LEVELS_FILE, levels_data)
 
-        channel = bot.get_channel(LEVEL_UP_CHANNEL_ID) if LEVEL_UP_CHANNEL_ID else message.channel
+        channel = get_guild_channel(message.guild.id, "level_up_channel") or message.channel
         if channel:
             embed = discord.Embed(description=f"🎉 {message.author.mention} leveled up to **Level {user_data['level']}**!", color=discord.Color.green())
             await channel.send(embed=embed)
+
+        # Level-role rewards: if this level has a reward role configured, and the role
+        # actually exists in this server (by name), give it to them.
+        reward_role_name = LEVEL_ROLE_REWARDS.get(user_data["level"])
+        if reward_role_name:
+            reward_role = discord.utils.get(message.guild.roles, name=reward_role_name)
+            if reward_role and reward_role not in message.author.roles:
+                try:
+                    await message.author.add_roles(reward_role, reason=f"Reached level {user_data['level']}")
+                    role_embed = discord.Embed(description=f"🏅 {message.author.mention} earned the **{reward_role_name}** role!", color=discord.Color.gold())
+                    await channel.send(embed=role_embed)
+                except discord.Forbidden:
+                    await dm_owner(f"⚠️ Tried to give {message.author} the '{reward_role_name}' role in {message.guild.name} but don't have permission.")
     else:
         save_json(LEVELS_FILE, levels_data)
 
@@ -886,7 +988,7 @@ async def on_message(message):
 # ============================================================
 async def custom_timeout(member: discord.Member, guild: discord.Guild, minutes: int, reason: str = "No reason given", moderator=None):
     timeout_role = discord.utils.get(guild.roles, name=TIMEOUT_ROLE_NAME)
-    timeout_channel = bot.get_channel(TIMEOUT_CHANNEL_ID)
+    timeout_channel = get_guild_channel(guild.id, "timeout_channel")
 
     if timeout_role is None:
         timeout_role = await guild.create_role(name=TIMEOUT_ROLE_NAME, reason="Auto-created for timeout system")
