@@ -1,13 +1,13 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import os
 import json
 import asyncio
 import datetime
 import random
+import re
 import requests
-from keep_alive import keep_alive
 
 # ============================================================
 # SETUP
@@ -49,9 +49,14 @@ def normalize_text(text: str) -> str:
     return normalized
 
 
-def contains_banned_word(text: str) -> bool:
+def contains_banned_word(text: str, guild_id=None) -> bool:
     normalized = normalize_text(text)
-    return any(word in normalized for word in BAD_WORDS)
+    words = BAD_WORDS
+    if guild_id is not None:
+        custom = guild_settings.get(str(guild_id), {}).get("banned_words", [])
+        if custom:
+            words = BAD_WORDS + custom
+    return any(word in normalized for word in words)
 
 SPAM_LIMIT = 5
 SPAM_SECONDS = 5
@@ -78,14 +83,14 @@ XP_COOLDOWN_SECONDS = 60
 # LEVEL_UP_CHANNEL_ID removed — level-up announcements now default to wherever the message
 # was sent, or a per-server configured channel (!setlevelupchannel).
 
-# Level-up role rewards: at these levels, the member automatically gets a role with this
-# EXACT name (the role must already exist in that server — create it manually first).
-# This applies the same way in every server the bot is in — role names must match.
-LEVEL_ROLE_REWARDS = {
-    5: "Active Member",
-    10: "Regular",
-    20: "Veteran",
-}
+# XP per message and level-up roles are now configured PER SERVER with commands
+# (!setxpamount, !setlevelrole, etc — see LEVELING CONFIG section) instead of hardcoded
+# here. These two constants are only the FALLBACK used until a server sets its own.
+DEFAULT_VOICE_XP_PER_MINUTE = 5  # fallback for !setvoicexpamount
+
+# If you ever set up a website with a full leaderboard view, paste its URL here and the
+# leaderboard embed will automatically add a "Click here" link to it. Leave as None until then.
+LEADERBOARD_WEBSITE_URL = None  # e.g. "https://yourbot.vercel.app/leaderboard"
 
 BOT_NAME = "Your Bot's Name"
 BOT_PERSONALITY = (
@@ -103,6 +108,9 @@ LEVELS_FILE = "levels.json"
 REACTION_ROLES_FILE = "reaction_roles.json"
 AFK_FILE = "afk.json"
 GUILD_SETTINGS_FILE = "guild_settings.json"
+BIRTHDAYS_FILE = "birthdays.json"
+GIVEAWAYS_FILE = "giveaways.json"
+STARBOARD_FILE = "starboard.json"
 
 
 def load_json(path):
@@ -125,8 +133,19 @@ reaction_roles = load_json(REACTION_ROLES_FILE)
 afk_data = load_json(AFK_FILE)
 # guild_settings.json format: {"guild_id": {"welcome_channel": id, "goodbye_channel": id,
 #                                             "mod_log_channel": id, "timeout_channel": id,
-#                                             "level_up_channel": id}}
+#                                             "level_up_channel": id, "xp_per_message": int,
+#                                             "voice_xp_per_minute": int,
+#                                             "level_roles": {"15": role_id, "7": role_id},
+#                                             "banned_words": [str, str, ...],
+#                                             "starboard_channel": id, "starboard_threshold": int,
+#                                             "birthday_channel": id}}
 guild_settings = load_json(GUILD_SETTINGS_FILE)
+# birthdays.json format: {"user_id": "MM-DD"}  — one birthday per user, global (not per-server)
+birthdays_data = load_json(BIRTHDAYS_FILE)
+# giveaways.json format: {"message_id": {"guild_id", "channel_id", "prize", "winners", "end_time"}}
+giveaways_data = load_json(GIVEAWAYS_FILE)
+# starboard.json format: {"original_message_id": {"guild_id", "starboard_message_id", "stars"}}
+starboard_data = load_json(STARBOARD_FILE)
 
 
 def get_guild_channel(guild_id, key):
@@ -144,6 +163,7 @@ def set_guild_channel(guild_id, key, channel_id):
 
 spam_tracker = {}
 xp_cooldowns = {}
+voice_sessions = {}  # runtime only: "guild_id:user_id" -> last XP checkpoint timestamp
 
 
 async def dm_owner(message: str):
@@ -159,6 +179,17 @@ def owner_only():
     not server admins, not anyone else, only you specifically."""
     async def predicate(ctx):
         return ctx.author.id == OWNER_ID
+    return commands.check(predicate)
+
+
+def backup_permission():
+    """Command check for backup/restore commands. Lets YOU (the bot owner) run these in
+    ANY server, or lets a server's own owner run them for THEIR server only — a server
+    owner can never touch another server's backups."""
+    async def predicate(ctx):
+        if ctx.author.id == OWNER_ID:
+            return True
+        return ctx.guild is not None and ctx.author.id == ctx.guild.owner_id
     return commands.check(predicate)
 
 
@@ -232,6 +263,18 @@ async def mod_log(guild: discord.Guild, action: str, target, moderator, reason: 
 # ============================================================
 # STARTUP
 # ============================================================
+@bot.event
+async def setup_hook():
+    """Runs exactly once, before the bot connects — the right place to start background
+    loops (unlike on_ready, which can fire more than once if Discord ever reconnects)."""
+    if not voice_xp_checkpoint.is_running():
+        voice_xp_checkpoint.start()
+    if not birthday_check.is_running():
+        birthday_check.start()
+    if not giveaway_check.is_running():
+        giveaway_check.start()
+
+
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} — bot is online!")
@@ -310,38 +353,128 @@ async def on_member_remove(member):
 
 
 # ============================================================
-# REACTION ROLES (now permanent — saved to reaction_roles.json)
+# REACTION ROLES (now permanent — saved to reaction_roles.json) + STARBOARD
 # ============================================================
+STAR_EMOJI = "⭐"
+
+
+async def update_starboard(payload):
+    """Re-checks a message's star count against this server's threshold. Posts it to the
+    starboard the first time it crosses the threshold, or just updates the star count on
+    an already-posted entry. Never un-posts one that drops back below threshold."""
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    settings = guild_settings.get(str(guild.id), {})
+    starboard_channel_id = settings.get("starboard_channel")
+    if not starboard_channel_id:
+        return
+    threshold = settings.get("starboard_threshold", 3)
+
+    source_channel = guild.get_channel(payload.channel_id)
+    if source_channel is None:
+        return
+    try:
+        message = await source_channel.fetch_message(payload.message_id)
+    except (discord.NotFound, discord.Forbidden):
+        return
+
+    star_reaction = discord.utils.get(message.reactions, emoji=STAR_EMOJI)
+    star_count = star_reaction.count if star_reaction else 0
+    entry = starboard_data.get(str(message.id))
+
+    if entry:
+        # Already posted — just keep the star count on the existing starboard message current.
+        starboard_channel = guild.get_channel(entry.get("starboard_channel_id", starboard_channel_id))
+        if starboard_channel is None:
+            return
+        try:
+            starboard_message = await starboard_channel.fetch_message(entry["starboard_message_id"])
+            embed = starboard_message.embeds[0]
+            embed.set_footer(text=f"⭐ {star_count} stars")
+            await starboard_message.edit(embed=embed)
+            entry["stars"] = star_count
+            save_json(STARBOARD_FILE, starboard_data)
+        except (discord.NotFound, discord.Forbidden, IndexError):
+            pass
+        return
+
+    if star_count < threshold:
+        return  # hasn't crossed the threshold yet — nothing to post
+
+    starboard_channel = guild.get_channel(starboard_channel_id)
+    if starboard_channel is None:
+        return
+
+    embed = discord.Embed(description=message.content or "*(no text content)*", color=discord.Color.gold())
+    embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
+    embed.add_field(name="Source", value=f"[Jump to message]({message.jump_url})", inline=False)
+    if message.attachments:
+        embed.set_image(url=message.attachments[0].url)
+    embed.set_footer(text=f"⭐ {star_count} stars")
+
+    starboard_message = await starboard_channel.send(embed=embed)
+    starboard_data[str(message.id)] = {
+        "guild_id": guild.id, "starboard_channel_id": starboard_channel.id,
+        "starboard_message_id": starboard_message.id, "stars": star_count,
+    }
+    save_json(STARBOARD_FILE, starboard_data)
+
+
 @bot.event
 async def on_raw_reaction_add(payload):
     if payload.user_id == bot.user.id:
         return
+
     role_map = reaction_roles.get(str(payload.message_id))
-    if not role_map:
-        return
-    role_id = role_map.get(str(payload.emoji))
-    if not role_id:
-        return
-    guild = bot.get_guild(payload.guild_id)
-    role = guild.get_role(role_id)
-    member = guild.get_member(payload.user_id)
-    if role and member:
-        await member.add_roles(role, reason="Reaction role")
+    if role_map:
+        role_id = role_map.get(str(payload.emoji))
+        if role_id:
+            guild = bot.get_guild(payload.guild_id)
+            role = guild.get_role(role_id) if guild else None
+            member = guild.get_member(payload.user_id) if guild else None
+            if role and member:
+                await member.add_roles(role, reason="Reaction role")
+
+    if str(payload.emoji) == STAR_EMOJI:
+        await update_starboard(payload)
 
 
 @bot.event
 async def on_raw_reaction_remove(payload):
     role_map = reaction_roles.get(str(payload.message_id))
-    if not role_map:
+    if role_map:
+        role_id = role_map.get(str(payload.emoji))
+        if role_id:
+            guild = bot.get_guild(payload.guild_id)
+            role = guild.get_role(role_id) if guild else None
+            member = guild.get_member(payload.user_id) if guild else None
+            if role and member:
+                await member.remove_roles(role, reason="Reaction role removed")
+
+    if str(payload.emoji) == STAR_EMOJI:
+        await update_starboard(payload)
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def setstarboardchannel(ctx, channel: discord.TextChannel):
+    """Sets THIS server's starboard channel. Usage: !setstarboardchannel #starboard"""
+    set_guild_channel(ctx.guild.id, "starboard_channel", channel.id)
+    await ctx.send(embed=discord.Embed(description=f"✅ Starred messages will now post to {channel.mention}.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def setstarboardthreshold(ctx, count: int):
+    """Sets how many ⭐ reactions a message needs to hit the starboard in THIS server.
+    Usage: !setstarboardthreshold 5 (default 3)"""
+    if count < 1:
+        await ctx.send(embed=discord.Embed(description="Threshold has to be at least 1.", color=discord.Color.red()))
         return
-    role_id = role_map.get(str(payload.emoji))
-    if not role_id:
-        return
-    guild = bot.get_guild(payload.guild_id)
-    role = guild.get_role(role_id)
-    member = guild.get_member(payload.user_id)
-    if role and member:
-        await member.remove_roles(role, reason="Reaction role removed")
+    guild_settings.setdefault(str(ctx.guild.id), {})["starboard_threshold"] = count
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"✅ Messages now need **{count}** ⭐ to hit the starboard here.", color=discord.Color.green()))
 
 
 @bot.hybrid_command()
@@ -398,10 +531,10 @@ async def createreactionrole(ctx, emoji: str, role: discord.Role, *, label: str 
 
 
 @bot.hybrid_command()
-@owner_only()
+@commands.has_permissions(manage_guild=True)
 async def setavatar(ctx):
     """Sets a DIFFERENT bot avatar/pfp just for this server (Discord supports per-server bot avatars).
-    Attach an image to this command's message. Only the bot owner can use this."""
+    Attach an image to this command's message. Needs Manage Server permission."""
     if not ctx.message.attachments:
         await ctx.send(embed=discord.Embed(description="Attach an image with this command to set a per-server avatar.", color=discord.Color.red()))
         return
@@ -414,9 +547,9 @@ async def setavatar(ctx):
 
 
 @bot.hybrid_command()
-@owner_only()
+@commands.has_permissions(manage_guild=True)
 async def setnickname(ctx, *, nickname: str):
-    """Sets the bot's nickname for THIS server only. Usage: !setnickname Amiz"""
+    """Sets the bot's nickname for THIS server only. Usage: !setnickname Amiz. Needs Manage Server permission."""
     await ctx.guild.me.edit(nick=nickname)
     await ctx.send(embed=discord.Embed(description=f"✅ Nickname set to **{nickname}** for this server.", color=discord.Color.green()))
 
@@ -467,17 +600,163 @@ async def setlevelupchannel(ctx, channel: discord.TextChannel):
     await ctx.send(embed=discord.Embed(description=f"✅ Level-up announcements will now post in {channel.mention}.", color=discord.Color.green()))
 
 
+# ============================================================
+# PER-SERVER BANNED WORDS — on top of the built-in slur filter, each server can add
+# its OWN extra words to block. Needs Manage Server permission.
+# ============================================================
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def addbannedword(ctx, *, word: str):
+    """Adds a word to THIS server's custom banned-word list (on top of the built-in filter).
+    Usage: !addbannedword sometermsused"""
+    word = word.lower().strip()
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    words = settings.setdefault("banned_words", [])
+    if word in words:
+        await ctx.send(embed=discord.Embed(description="That word is already banned here.", color=discord.Color.greyple()))
+        return
+    words.append(word)
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"✅ Added to this server's banned words list. ({len(words)} custom word(s) total)", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def removebannedword(ctx, *, word: str):
+    """Removes a word from THIS server's custom banned-word list. Usage: !removebannedword sometermsused"""
+    word = word.lower().strip()
+    words = guild_settings.get(str(ctx.guild.id), {}).get("banned_words", [])
+    if word not in words:
+        await ctx.send(embed=discord.Embed(description="That word isn't on this server's custom list.", color=discord.Color.red()))
+        return
+    words.remove(word)
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"🗑️ Removed. ({len(words)} custom word(s) left)", color=discord.Color.orange()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def bannedwords(ctx):
+    """Lists THIS server's custom banned words (not the built-in base filter)."""
+    words = guild_settings.get(str(ctx.guild.id), {}).get("banned_words", [])
+    if not words:
+        await ctx.send(embed=discord.Embed(description="No custom banned words added yet — use `!addbannedword`.", color=discord.Color.greyple()))
+        return
+    await ctx.send(embed=discord.Embed(title="🚫 Custom Banned Words", description=", ".join(f"`{w}`" for w in words), color=discord.Color.blurple()))
+
+
+# ============================================================
+# LEVELING CONFIG — XP-per-message, voice XP rate, and level-up role rewards, all
+# configured PER SERVER. Needs Manage Server permission.
+# ============================================================
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def setxpamount(ctx, amount: int):
+    """Sets how much XP a message earns in THIS server. Usage: !setxpamount 20 (default 15)"""
+    if amount < 1:
+        await ctx.send(embed=discord.Embed(description="XP amount has to be at least 1.", color=discord.Color.red()))
+        return
+    guild_settings.setdefault(str(ctx.guild.id), {})["xp_per_message"] = amount
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"✅ Messages now earn **{amount} XP** in this server.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def setvoicexpamount(ctx, amount: int):
+    """Sets how much XP per minute members earn for being active in a voice channel in
+    THIS server. Usage: !setvoicexpamount 5 (default 5). Set to 0 to disable voice XP here."""
+    if amount < 0:
+        await ctx.send(embed=discord.Embed(description="XP amount can't be negative.", color=discord.Color.red()))
+        return
+    guild_settings.setdefault(str(ctx.guild.id), {})["voice_xp_per_minute"] = amount
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"✅ Voice XP set to **{amount} XP/minute** in this server.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def setlevelrole(ctx, level: int, role: discord.Role):
+    """Sets a role to be auto-given when someone reaches a level, IN THIS SERVER ONLY.
+    Usage: !setlevelrole 15 @Wizard — every server can use completely different levels/roles."""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    level_roles = settings.setdefault("level_roles", {})
+    level_roles[str(level)] = role.id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"✅ Reaching **Level {level}** now grants {role.mention} in this server.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def removelevelrole(ctx, level: int):
+    """Removes a level-up role reward from THIS server. Usage: !removelevelrole 15"""
+    level_roles = guild_settings.get(str(ctx.guild.id), {}).get("level_roles", {})
+    if str(level) not in level_roles:
+        await ctx.send(embed=discord.Embed(description=f"No role is set for level {level} here.", color=discord.Color.red()))
+        return
+    del level_roles[str(level)]
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"🗑️ Removed the level {level} role reward.", color=discord.Color.orange()))
+
+
+@bot.hybrid_command()
+async def listlevelroles(ctx):
+    """Shows every level-up role reward configured for THIS server."""
+    level_roles = guild_settings.get(str(ctx.guild.id), {}).get("level_roles", {})
+    if not level_roles:
+        await ctx.send(embed=discord.Embed(description="No level-up roles configured here yet.", color=discord.Color.greyple()))
+        return
+    lines = []
+    for level_str, role_id in sorted(level_roles.items(), key=lambda x: int(x[0])):
+        role = ctx.guild.get_role(role_id)
+        lines.append(f"**Level {level_str}** → {role.mention if role else '`(deleted role)`'}")
+    await ctx.send(embed=discord.Embed(title="🏅 Level-Up Roles", description="\n".join(lines), color=discord.Color.gold()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def setlevel(ctx, member: discord.Member, level: int):
+    """Directly sets a member's level in THIS server (resets their XP progress to 0 for that
+    level). Usage: !setlevel @someone 10"""
+    if level < 0:
+        await ctx.send(embed=discord.Embed(description="Level can't be negative.", color=discord.Color.red()))
+        return
+    guild_id = str(ctx.guild.id)
+    guild_levels = levels_data.setdefault(guild_id, {})
+    guild_levels[str(member.id)] = {"xp": 0, "level": level}
+    save_json(LEVELS_FILE, levels_data)
+    await ctx.send(embed=discord.Embed(description=f"✅ Set {member.mention}'s level to **{level}** in this server.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def addxp(ctx, member: discord.Member, amount: int):
+    """Gives a member a specific amount of XP in THIS server (handles level-ups + role
+    rewards the same as normal chat XP). Usage: !addxp @someone 500. Use a negative
+    number to take XP away."""
+    await grant_xp(member, ctx.guild, amount, announce_channel=ctx.channel)
+    data = levels_data.get(str(ctx.guild.id), {}).get(str(member.id), {"xp": 0, "level": 0})
+    await ctx.send(embed=discord.Embed(description=f"✅ Gave {member.mention} **{amount} XP**. Now: Level {data['level']}, {data['xp']} XP.", color=discord.Color.green()))
+
+
 @bot.hybrid_command()
 async def showsettings(ctx):
-    """Shows this server's currently configured channels."""
+    """Shows this server's currently configured channels and settings."""
     settings = guild_settings.get(str(ctx.guild.id), {})
     embed = discord.Embed(title=f"⚙️ Settings for {ctx.guild.name}", color=discord.Color.blurple())
     for label, key in [("Welcome channel", "welcome_channel"), ("Goodbye channel", "goodbye_channel"),
                         ("Mod-log channel", "mod_log_channel"), ("Timeout channel", "timeout_channel"),
-                        ("Level-up channel", "level_up_channel")]:
+                        ("Level-up channel", "level_up_channel"), ("Birthday channel", "birthday_channel"),
+                        ("Starboard channel", "starboard_channel")]:
         channel_id = settings.get(key)
         value = f"<#{channel_id}>" if channel_id else "*not set*"
         embed.add_field(name=label, value=value, inline=False)
+
+    embed.add_field(name="XP per message", value=str(settings.get("xp_per_message", XP_PER_MESSAGE)), inline=True)
+    embed.add_field(name="Voice XP/minute", value=str(settings.get("voice_xp_per_minute", DEFAULT_VOICE_XP_PER_MINUTE)), inline=True)
+    embed.add_field(name="Starboard threshold", value=str(settings.get("starboard_threshold", 3)), inline=True)
+    embed.add_field(name="Custom banned words", value=str(len(settings.get("banned_words", []))), inline=True)
+    embed.add_field(name="Level-up roles set", value=str(len(settings.get("level_roles", {}))), inline=True)
     await ctx.send(embed=embed)
 
 
@@ -716,6 +995,49 @@ def level_from_total(total_xp):
     return level, remaining
 
 
+async def grant_xp(member, guild, amount, announce_channel=None):
+    """Core XP-granting logic — shared by chat XP, voice XP, and the admin !addxp command.
+    Handles (possibly several, if the XP jump is big) level-ups and level-up role rewards,
+    both configured PER SERVER via !setlevelrole. announce_channel is where level-up
+    messages post if the server hasn't configured its own level-up channel."""
+    guild_id = str(guild.id)
+    user_id = str(member.id)
+    guild_levels = levels_data.setdefault(guild_id, {})
+    user_data = guild_levels.setdefault(user_id, {"xp": 0, "level": 0})
+    user_data["xp"] += amount
+    if user_data["xp"] < 0:
+        user_data["xp"] = 0
+
+    channel = get_guild_channel(guild.id, "level_up_channel") or announce_channel
+    level_roles = guild_settings.get(guild_id, {}).get("level_roles", {})
+
+    while user_data["xp"] >= get_level_xp(user_data["level"]):
+        user_data["xp"] -= get_level_xp(user_data["level"])
+        user_data["level"] += 1
+
+        if channel:
+            embed = discord.Embed(description=f"🎉 {member.mention} leveled up to **Level {user_data['level']}**!", color=discord.Color.green())
+            try:
+                await channel.send(embed=embed)
+            except discord.Forbidden:
+                pass
+
+        # Level-role rewards: PER SERVER now — set with !setlevelrole, stored by role ID.
+        reward_role_id = level_roles.get(str(user_data["level"]))
+        if reward_role_id:
+            reward_role = guild.get_role(reward_role_id)
+            if reward_role and reward_role not in member.roles:
+                try:
+                    await member.add_roles(reward_role, reason=f"Reached level {user_data['level']}")
+                    if channel:
+                        role_embed = discord.Embed(description=f"🏅 {member.mention} earned the **{reward_role.name}** role!", color=discord.Color.gold())
+                        await channel.send(embed=role_embed)
+                except discord.Forbidden:
+                    await dm_owner(f"⚠️ Tried to give {member} the '{reward_role.name}' role in {guild.name} but don't have permission.")
+
+    save_json(LEVELS_FILE, levels_data)
+
+
 async def add_xp(message):
     guild_id = str(message.guild.id)
     user_id = str(message.author.id)
@@ -726,35 +1048,142 @@ async def add_xp(message):
         return
     xp_cooldowns[cooldown_key] = now
 
-    guild_levels = levels_data.setdefault(guild_id, {})
-    user_data = guild_levels.setdefault(user_id, {"xp": 0, "level": 0})
-    user_data["xp"] += XP_PER_MESSAGE
+    xp_amount = guild_settings.get(guild_id, {}).get("xp_per_message", XP_PER_MESSAGE)
+    await grant_xp(message.author, message.guild, xp_amount, announce_channel=message.channel)
 
-    needed = get_level_xp(user_data["level"])
-    if user_data["xp"] >= needed:
-        user_data["xp"] = 0
-        user_data["level"] += 1
-        save_json(LEVELS_FILE, levels_data)
 
-        channel = get_guild_channel(message.guild.id, "level_up_channel") or message.channel
-        if channel:
-            embed = discord.Embed(description=f"🎉 {message.author.mention} leveled up to **Level {user_data['level']}**!", color=discord.Color.green())
-            await channel.send(embed=embed)
+# ============================================================
+# VOICE XP — awards XP for time spent actively in a voice channel with at least one
+# other non-bot member. Rate is configurable per server (!setvoicexpamount, default
+# DEFAULT_VOICE_XP_PER_MINUTE). Credited periodically via voice_xp_checkpoint() below
+# (every VOICE_XP_CHECK_INTERVAL_MINUTES) so long sessions don't wait until someone
+# leaves to get XP, and so a bot restart never loses more than one interval's credit.
+# ============================================================
+VOICE_XP_CHECK_INTERVAL_MINUTES = 5
 
-        # Level-role rewards: if this level has a reward role configured, and the role
-        # actually exists in this server (by name), give it to them.
-        reward_role_name = LEVEL_ROLE_REWARDS.get(user_data["level"])
-        if reward_role_name:
-            reward_role = discord.utils.get(message.guild.roles, name=reward_role_name)
-            if reward_role and reward_role not in message.author.roles:
+
+async def award_voice_xp(guild, member, minutes_elapsed):
+    rate = guild_settings.get(str(guild.id), {}).get("voice_xp_per_minute", DEFAULT_VOICE_XP_PER_MINUTE)
+    if rate <= 0 or minutes_elapsed <= 0:
+        return
+    await grant_xp(member, guild, int(rate * minutes_elapsed))
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.bot:
+        return
+    key = f"{member.guild.id}:{member.id}"
+
+    def channel_counts_as_active(channel):
+        if channel is None:
+            return False
+        if channel == channel.guild.afk_channel:
+            return False
+        return len([m for m in channel.members if not m.bot]) >= 2
+
+    was_active = channel_counts_as_active(before.channel)
+    now_active = channel_counts_as_active(after.channel)
+
+    if was_active and key in voice_sessions:
+        elapsed_minutes = (datetime.datetime.utcnow().timestamp() - voice_sessions.pop(key)) / 60
+        await award_voice_xp(member.guild, member, elapsed_minutes)
+
+    if now_active:
+        voice_sessions[key] = datetime.datetime.utcnow().timestamp()
+
+
+@tasks.loop(minutes=VOICE_XP_CHECK_INTERVAL_MINUTES)
+async def voice_xp_checkpoint():
+    """Periodically pays out XP for everyone still actively in voice, so long sessions
+    accrue XP without waiting for someone to leave the channel."""
+    now = datetime.datetime.utcnow().timestamp()
+    for key in list(voice_sessions.keys()):
+        guild_id_str, user_id_str = key.split(":")
+        guild = bot.get_guild(int(guild_id_str))
+        if guild is None:
+            voice_sessions.pop(key, None)
+            continue
+        member = guild.get_member(int(user_id_str))
+        voice_state = member.voice if member else None
+        still_active = (
+            member is not None and voice_state is not None and voice_state.channel is not None
+            and voice_state.channel != guild.afk_channel
+            and len([m for m in voice_state.channel.members if not m.bot]) >= 2
+        )
+        if not still_active:
+            voice_sessions.pop(key, None)
+            continue
+        elapsed_minutes = (now - voice_sessions[key]) / 60
+        voice_sessions[key] = now
+        await award_voice_xp(guild, member, elapsed_minutes)
+
+
+# ============================================================
+# BIRTHDAYS — a birthday is one global fact per user (year isn't stored, just month/day —
+# nobody needs a bot announcing their age). Each server picks its OWN announcement channel.
+# ============================================================
+def parse_birthday(text: str):
+    """Accepts MM-DD or MM/DD. Returns 'MM-DD' string, or None if invalid."""
+    text = text.strip().replace("/", "-")
+    try:
+        parsed = datetime.datetime.strptime(text, "%m-%d")
+        return parsed.strftime("%m-%d")
+    except ValueError:
+        return None
+
+
+@bot.hybrid_command()
+async def setbirthday(ctx, date: str):
+    """Sets YOUR birthday (month + day only — no year). Usage: !setbirthday 04-20 or !setbirthday 04/20"""
+    parsed = parse_birthday(date)
+    if not parsed:
+        await ctx.send(embed=discord.Embed(description="Couldn't read that date — use `MM-DD`, e.g. `!setbirthday 04-20`.", color=discord.Color.red()))
+        return
+    birthdays_data[str(ctx.author.id)] = parsed
+    save_json(BIRTHDAYS_FILE, birthdays_data)
+    await ctx.send(embed=discord.Embed(description=f"🎂 Got it — your birthday is set to **{parsed}**.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+async def birthday(ctx, member: discord.Member = None):
+    """Shows your (or someone's) saved birthday."""
+    member = member or ctx.author
+    saved = birthdays_data.get(str(member.id))
+    if not saved:
+        await ctx.send(embed=discord.Embed(description=f"{member.mention} hasn't set a birthday yet." if member != ctx.author else "You haven't set a birthday yet — use `!setbirthday MM-DD`.", color=discord.Color.greyple()))
+        return
+    await ctx.send(embed=discord.Embed(description=f"🎂 {member.mention}'s birthday is **{saved}**.", color=discord.Color.blurple()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def setbirthdaychannel(ctx, channel: discord.TextChannel):
+    """Sets THIS server's birthday-announcement channel. Usage: !setbirthdaychannel #birthdays"""
+    set_guild_channel(ctx.guild.id, "birthday_channel", channel.id)
+    await ctx.send(embed=discord.Embed(description=f"✅ Birthday announcements will now post in {channel.mention}.", color=discord.Color.green()))
+
+
+@tasks.loop(time=datetime.time(hour=9, minute=0, tzinfo=datetime.timezone.utc))
+async def birthday_check():
+    """Runs once a day. For every server with a birthday channel set, announces any current
+    member whose saved birthday is today."""
+    today = datetime.datetime.utcnow().strftime("%m-%d")
+    birthday_users = {uid for uid, bday in birthdays_data.items() if bday == today}
+    if not birthday_users:
+        return
+    for guild in bot.guilds:
+        channel = get_guild_channel(guild.id, "birthday_channel")
+        if not channel:
+            continue
+        for user_id in birthday_users:
+            member = guild.get_member(int(user_id))
+            if member:
+                embed = discord.Embed(description=f"🎂🎉 Happy Birthday {member.mention}! Hope it's a great one!", color=discord.Color.gold())
                 try:
-                    await message.author.add_roles(reward_role, reason=f"Reached level {user_data['level']}")
-                    role_embed = discord.Embed(description=f"🏅 {message.author.mention} earned the **{reward_role_name}** role!", color=discord.Color.gold())
-                    await channel.send(embed=role_embed)
+                    await channel.send(embed=embed)
                 except discord.Forbidden:
-                    await dm_owner(f"⚠️ Tried to give {message.author} the '{reward_role_name}' role in {message.guild.name} but don't have permission.")
-    else:
-        save_json(LEVELS_FILE, levels_data)
+                    pass
 
 
 @bot.hybrid_command()
@@ -777,27 +1206,52 @@ async def rank(ctx, member: discord.Member = None):
     await ctx.send(embed=embed)
 
 
+class LeaderboardCategorySelect(discord.ui.Select):
+    """A dropdown under the leaderboard. Only 'Overall XP' exists right now, but this is
+    built so you can add more options later (e.g. Weekly XP, Voice XP) without redoing the UI —
+    just add more SelectOptions and branch on interaction.data['values'][0] in the callback."""
+    def __init__(self):
+        options = [discord.SelectOption(label="Overall XP", value="overall", emoji="⭐", default=True)]
+        super().__init__(placeholder="Overall XP", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "Only **Overall XP** is tracked right now — more categories may come later!",
+            ephemeral=True,
+        )
+
+
+class LeaderboardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(LeaderboardCategorySelect())
+
+
 @bot.hybrid_command()
 async def leaderboard(ctx):
-    """Shows the top 10 in THIS server only."""
+    """Shows the top 10 in THIS server only, styled as a compact ranked list with a category dropdown."""
     guild_levels = levels_data.get(str(ctx.guild.id), {})
     if not guild_levels:
         await ctx.send(embed=discord.Embed(description="No one has earned XP yet in this server!", color=discord.Color.greyple()))
         return
     sorted_users = sorted(guild_levels.items(), key=lambda x: (x[1]["level"], x[1]["xp"]), reverse=True)[:10]
 
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    lines = []
-    for i, (user_id, data) in enumerate(sorted_users, start=1):
-        user = await bot.fetch_user(int(user_id))
-        prefix = medals.get(i, f"`#{i}`")
-        lines.append(f"{prefix} **{user.name}** — Level {data['level']} ({data['xp']} XP)")
+    embed = discord.Embed(color=discord.Color.dark_teal())
+    embed.set_author(
+        name=f"{ctx.guild.name}'s xp leaderboard",
+        icon_url=(ctx.guild.icon.url if ctx.guild.icon else bot.user.display_avatar.url),
+    )
 
-    embed = discord.Embed(title=f"🏆 {ctx.guild.name} Leaderboard", description="\n".join(lines), color=discord.Color.gold())
-    if ctx.guild.icon:
-        embed.set_thumbnail(url=ctx.guild.icon.url)
+    intro = "Want to view more than the top 10 users?"
+    if LEADERBOARD_WEBSITE_URL:
+        intro += f" [Click here]({LEADERBOARD_WEBSITE_URL})"
+    embed.description = intro
+
+    for i, (user_id, data) in enumerate(sorted_users, start=1):
+        embed.add_field(name="\u200b", value=f"**#{i}** • <@{user_id}> • LVL: {data['level']}", inline=False)
+
     embed.set_footer(text=f"Top {len(sorted_users)} members by level — this server only")
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, view=LeaderboardView())
 
 
 @bot.hybrid_command()
@@ -825,6 +1279,138 @@ async def globalleaderboard(ctx):
     embed = discord.Embed(title="🌐 Global Leaderboard", description="\n".join(lines), color=discord.Color.purple())
     embed.set_footer(text="Combines XP from every server I'm in — higher levels take more XP to reach, so totals aren't just added levels")
     await ctx.send(embed=embed)
+
+
+# ============================================================
+# GIVEAWAYS — react-to-enter, timed, with multiple possible winners. Ended
+# automatically by a background loop (giveaway_check), or early with !gend.
+# ============================================================
+DURATION_RE = re.compile(r"(\d+)\s*(d|h|m|s)", re.IGNORECASE)
+DURATION_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration(text: str):
+    """Parses durations like '10m', '2h', '1d', or combined '1d12h'. Returns total seconds,
+    or None if nothing valid was found."""
+    matches = DURATION_RE.findall(text.strip().lower())
+    if not matches:
+        return None
+    total = sum(int(amount) * DURATION_UNIT_SECONDS[unit] for amount, unit in matches)
+    return total if total > 0 else None
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def giveaway(ctx, duration: str, winners: int, *, prize: str):
+    """Starts a giveaway. Usage: !giveaway 1h 1 Nitro Classic
+    Duration examples: 30s, 10m, 2h, 1d, or combined like 1d12h."""
+    seconds = parse_duration(duration)
+    if not seconds:
+        await ctx.send(embed=discord.Embed(description="Couldn't read that duration — try `10m`, `2h`, `1d`, or `1d12h`.", color=discord.Color.red()))
+        return
+    if winners < 1:
+        await ctx.send(embed=discord.Embed(description="Needs at least 1 winner.", color=discord.Color.red()))
+        return
+
+    end_time = datetime.datetime.utcnow().timestamp() + seconds
+    embed = discord.Embed(
+        title="🎉 GIVEAWAY 🎉",
+        description=(f"**{prize}**\n\nReact with 🎉 to enter!\n"
+                      f"Ends: <t:{int(end_time)}:R>\nWinners: **{winners}**\nHosted by: {ctx.author.mention}"),
+        color=discord.Color.fuchsia(),
+    )
+    msg = await ctx.send(embed=embed)
+    await msg.add_reaction("🎉")
+
+    giveaways_data[str(msg.id)] = {
+        "guild_id": ctx.guild.id, "channel_id": ctx.channel.id, "prize": prize,
+        "winners": winners, "end_time": end_time, "host_id": ctx.author.id,
+    }
+    save_json(GIVEAWAYS_FILE, giveaways_data)
+
+
+async def end_giveaway(message_id: str, data: dict):
+    guild = bot.get_guild(data["guild_id"])
+    channel = guild.get_channel(data["channel_id"]) if guild else None
+    if channel is None:
+        giveaways_data.pop(message_id, None)
+        save_json(GIVEAWAYS_FILE, giveaways_data)
+        return
+    try:
+        message = await channel.fetch_message(int(message_id))
+    except (discord.NotFound, discord.Forbidden):
+        giveaways_data.pop(message_id, None)
+        save_json(GIVEAWAYS_FILE, giveaways_data)
+        return
+
+    reaction = discord.utils.get(message.reactions, emoji="🎉")
+    entrants = [user async for user in reaction.users() if not user.bot] if reaction else []
+
+    if entrants:
+        pick_count = min(data["winners"], len(entrants))
+        pick = random.sample(entrants, pick_count)
+        winner_mentions = ", ".join(w.mention for w in pick)
+        result_text = f"🎉 Congrats {winner_mentions}! You won **{data['prize']}**!"
+    else:
+        winner_mentions = "None — no valid entries"
+        result_text = f"No valid entries — nobody won **{data['prize']}**."
+
+    ended_embed = discord.Embed(
+        title="🎉 GIVEAWAY ENDED 🎉",
+        description=f"**{data['prize']}**\n\nWinner(s): {winner_mentions}",
+        color=discord.Color.dark_grey(),
+    )
+    try:
+        await message.edit(embed=ended_embed)
+    except discord.Forbidden:
+        pass
+    await channel.send(result_text)
+
+    giveaways_data.pop(message_id, None)
+    save_json(GIVEAWAYS_FILE, giveaways_data)
+
+
+@tasks.loop(seconds=30)
+async def giveaway_check():
+    now = datetime.datetime.utcnow().timestamp()
+    ended = [mid for mid, data in giveaways_data.items() if data["end_time"] <= now]
+    for message_id in ended:
+        data = giveaways_data.get(message_id)
+        if data:
+            await end_giveaway(message_id, data)
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def gend(ctx, message_id: str):
+    """Ends a giveaway early. Usage: !gend <message_id>"""
+    data = giveaways_data.get(message_id)
+    if not data:
+        await ctx.send(embed=discord.Embed(description="No active giveaway with that message ID.", color=discord.Color.red()))
+        return
+    await end_giveaway(message_id, data)
+    await ctx.send(embed=discord.Embed(description="✅ Giveaway ended.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.has_permissions(manage_guild=True)
+async def greroll(ctx, message_id: str):
+    """Re-picks one winner for an ALREADY-ENDED giveaway. Run this in the same channel
+    the giveaway was posted in. Usage: !greroll <message_id>"""
+    try:
+        message = await ctx.channel.fetch_message(int(message_id))
+    except (discord.NotFound, discord.Forbidden, ValueError):
+        await ctx.send(embed=discord.Embed(description="Couldn't find that message in this channel.", color=discord.Color.red()))
+        return
+
+    reaction = discord.utils.get(message.reactions, emoji="🎉")
+    entrants = [user async for user in reaction.users() if not user.bot] if reaction else []
+    if not entrants:
+        await ctx.send(embed=discord.Embed(description="No valid entrants to reroll from.", color=discord.Color.red()))
+        return
+
+    winner = random.choice(entrants)
+    await ctx.send(embed=discord.Embed(description=f"🎉 New winner: {winner.mention}!", color=discord.Color.fuchsia()))
 
 
 # ============================================================
@@ -933,7 +1519,7 @@ async def on_message(message):
 
     content_lower = message.content.lower()
 
-    if contains_banned_word(message.content):
+    if contains_banned_word(message.content, message.guild.id):
         await message.delete()
         await message.channel.send(embed=discord.Embed(description=f"{message.author.mention}, that language isn't allowed here.", color=discord.Color.red()), delete_after=5)
         await dm_owner(f"🚫 Deleted a message from **{message.author}** in #{message.channel} (banned word):\n> {message.content}")
@@ -1147,15 +1733,24 @@ BACKUPS_FOLDER = "backups"
 os.makedirs(BACKUPS_FOLDER, exist_ok=True)
 
 
-def list_backup_names():
-    return [f.replace(".json", "") for f in os.listdir(BACKUPS_FOLDER) if f.endswith(".json")]
+def guild_backup_folder(guild_id):
+    """Each server gets its own backup subfolder, so a server owner using these commands
+    can only ever see or restore backups made FROM their own server."""
+    folder = os.path.join(BACKUPS_FOLDER, str(guild_id))
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def list_backup_names(guild_id):
+    return [f.replace(".json", "") for f in os.listdir(guild_backup_folder(guild_id)) if f.endswith(".json")]
 
 
 @bot.hybrid_command()
-@owner_only()
+@backup_permission()
 async def backupserver(ctx, backup_name: str):
     """Saves this server's roles, channels (with permission overwrites), and who has which
-    custom role, to a file. Usage: !backupserver mybackup. Only the bot owner can use this."""
+    custom role, to a file. Usage: !backupserver mybackup. Usable by you (the bot owner, in
+    any server) or by that server's own owner (for their own server only)."""
     guild = ctx.guild
     data = {"roles": [], "categories": [], "channels": [], "member_roles": {}}
 
@@ -1208,9 +1803,9 @@ async def backupserver(ctx, backup_name: str):
         if member_role_names:
             data["member_roles"][str(member.id)] = member_role_names
 
-    path = os.path.join(BACKUPS_FOLDER, f"{backup_name}.json")
+    path = os.path.join(guild_backup_folder(guild.id), f"{backup_name}.json")
     save_json(path, data)
-    all_backups = list_backup_names()
+    all_backups = list_backup_names(guild.id)
     embed = discord.Embed(
         title="💾 Server Backed Up",
         description=(f"Saved as `{backup_name}` — {len(data['roles'])} roles, {len(data['categories'])} categories, "
@@ -1222,13 +1817,14 @@ async def backupserver(ctx, backup_name: str):
 
 
 @bot.hybrid_command()
-@owner_only()
+@backup_permission()
 async def restoreserver(ctx, backup_name: str = None):
     """Recreates roles/channels (with permissions) from a saved backup INTO THIS server, and
     automatically re-assigns saved roles to any current member who had one. Usage: !restoreserver mybackup
-    Run with no name to see your current saves. Only the bot owner can use this.
+    Run with no name to see your current saves. Usable by you (the bot owner, in any server) or by
+    that server's own owner (for their own server only) — restores only pull from THIS server's saves.
     Only rebuilds structure + role assignments — does not restore messages."""
-    all_backups = list_backup_names()
+    all_backups = list_backup_names(ctx.guild.id)
 
     if backup_name is None:
         embed = discord.Embed(title="📁 Your Saves", color=discord.Color.blurple())
@@ -1239,7 +1835,7 @@ async def restoreserver(ctx, backup_name: str = None):
         await ctx.send(embed=embed)
         return
 
-    path = os.path.join(BACKUPS_FOLDER, f"{backup_name}.json")
+    path = os.path.join(guild_backup_folder(ctx.guild.id), f"{backup_name}.json")
     if not os.path.exists(path):
         embed = discord.Embed(
             description=f"❌ No backup found named `{backup_name}`.\n📁 Your saves: {', '.join(f'`{b}`' for b in all_backups) if all_backups else '(none yet)'}",
@@ -1320,15 +1916,15 @@ async def restoreserver(ctx, backup_name: str = None):
 
 
 @bot.hybrid_command()
-@owner_only()
+@backup_permission()
 async def listbackups(ctx):
-    """Lists all saved backups. Only the bot owner can use this."""
-    files = list_backup_names()
+    """Lists all backups saved from THIS server. Usable by you (the bot owner) or this
+    server's own owner."""
+    files = list_backup_names(ctx.guild.id)
     if not files:
         await ctx.send(embed=discord.Embed(description="No backups saved yet.", color=discord.Color.greyple()))
     else:
         await ctx.send(embed=discord.Embed(title="💾 Saved Backups", description="\n".join(f"- `{f}`" for f in files), color=discord.Color.blurple()))
 
 
-keep_alive()
 bot.run(TOKEN)
