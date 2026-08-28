@@ -2263,6 +2263,39 @@ def reload_all_data():
 
 @bot.hybrid_command()
 @owner_only()
+@discord.app_commands.describe(message="What to announce — sent as an embed in every server I'm currently in")
+async def broadcast(ctx, *, message: str):
+    """Bot-creator only. Posts an embed with your message into every server the bot is
+    currently in (system channel if possible, otherwise the first channel it can talk in).
+    Handy for things like maintenance-mode notices. Usage: !broadcast Going down for
+    maintenance at 10pm EST, back in an hour."""
+    embed = discord.Embed(title="📢 Announcement", description=message, color=discord.Color.gold())
+    embed.set_footer(text=f"Message from {bot.user.name}'s creator")
+
+    sent, failed = 0, []
+    for guild in bot.guilds:
+        channel = await find_greetable_channel(guild)
+        if channel is None:
+            failed.append(guild.name)
+            continue
+        try:
+            await channel.send(embed=embed)
+            sent += 1
+        except discord.Forbidden:
+            failed.append(guild.name)
+
+    summary = discord.Embed(
+        title="📢 Broadcast Sent",
+        description=f"Delivered to **{sent}/{len(bot.guilds)}** server(s).",
+        color=discord.Color.green() if not failed else discord.Color.orange(),
+    )
+    if failed:
+        summary.add_field(name="⚠️ Couldn't reach", value=", ".join(failed)[:1024], inline=False)
+    await ctx.send(embed=summary)
+
+
+@bot.hybrid_command()
+@owner_only()
 async def exportdata(ctx):
     """DMs you a zip of every save file — levels, birthdays, settings, reaction roles,
     starboard, and every server backup — so you have a copy that survives a host wipe.
