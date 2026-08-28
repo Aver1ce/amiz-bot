@@ -8,6 +8,10 @@ import datetime
 import random
 import re
 import requests
+import typing
+import zipfile
+import io
+import glob
 
 # ============================================================
 # SETUP
@@ -166,10 +170,10 @@ xp_cooldowns = {}
 voice_sessions = {}  # runtime only: "guild_id:user_id" -> last XP checkpoint timestamp
 
 
-async def dm_owner(message: str):
+async def dm_owner(message: str, color=discord.Color.blurple()):
     try:
         owner = await bot.fetch_user(OWNER_ID)
-        await owner.send(message)
+        await owner.send(embed=discord.Embed(description=message, color=color))
     except Exception as e:
         print(f"Could not DM owner: {e}")
 
@@ -179,6 +183,26 @@ def owner_only():
     not server admins, not anyone else, only you specifically."""
     async def predicate(ctx):
         return ctx.author.id == OWNER_ID
+    return commands.check(predicate)
+
+
+def has_permissions_or_owner(**perms):
+    """Drop-in replacement for the old @commands.has_permissions(...) decorator. Works exactly
+    the same for everyone else, but the bot owner (OWNER_ID) always passes, regardless of their
+    actual permissions in that server."""
+    invalid = set(perms) - set(discord.Permissions.VALID_FLAGS)
+    if invalid:
+        raise TypeError(f"Invalid permission(s): {', '.join(invalid)}")
+
+    async def predicate(ctx):
+        if ctx.author.id == OWNER_ID:
+            return True
+        permissions = ctx.channel.permissions_for(ctx.author)
+        missing = [perm for perm, value in perms.items() if getattr(permissions, perm) != value]
+        if not missing:
+            return True
+        raise commands.MissingPermissions(missing)
+
     return commands.check(predicate)
 
 
@@ -273,6 +297,8 @@ async def setup_hook():
         birthday_check.start()
     if not giveaway_check.is_running():
         giveaway_check.start()
+    if not auto_data_backup.is_running():
+        auto_data_backup.start()
 
 
 @bot.event
@@ -294,13 +320,84 @@ async def on_ready():
     await dm_owner(f"✅ **{bot.user.name}** just came online.")
 
 
+def build_setup_guide_embed(guild: discord.Guild) -> discord.Embed:
+    """The embed posted in a server right after the bot joins, explaining how to set things up."""
+    embed = discord.Embed(
+        title=f"👋 Thanks for adding {bot.user.name}!",
+        description=(
+            f"Before anything else: **make sure I stay in this server, and that I have "
+            f"Administrator permission** — most of my features (backups, moderation, channel "
+            f"setup) need it to work properly. My owner can run any of my commands here "
+            f"regardless of their own permissions, but I'll only operate in this server at all "
+            f"while they're a member of it — that's a built-in safety lock, not a bug.\n\n"
+            f"Prefix commands use `!`, or use the same commands as `/slash` commands anywhere."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="⚙️ Setup (needs Manage Server)",
+        value=(
+            "`setwelcomechannel` `setgoodbyechannel` `setmodlogchannel` `settimeoutchannel`\n"
+            "`setlevelupchannel` `setbirthdaychannel` `setstarboardchannel` `setstarboardthreshold`\n"
+            "`setxpamount` `setvoicexpamount` `setlevelrole` `addbannedword` `showsettings`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛡️ Moderation",
+        value=(
+            "`kick` `ban` `timeout` `untimeout` `clear` `clearuser` `clearkeyword`\n"
+            "`lockdown` `unlock` `bannedwords` `removebannedword`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📈 Leveling, Reaction Roles & Fun",
+        value=(
+            "`rank` `leaderboard` `globalleaderboard` `setlevel` `addxp` `afk`\n"
+            "`giveaway` `gend` `greroll` `reactionrole` `createreactionrole` `removereactionrole`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🎂 Birthdays & ⭐ Starboard",
+        value="`setbirthday` `birthday` `setbirthdaychannel` `setstarboardchannel` `setstarboardthreshold`",
+        inline=False,
+    )
+    embed.add_field(
+        name="💾 Server Backups",
+        value=(
+            "`backupserver <name>` — saves roles/channels and keeps auto-syncing them\n"
+            "`restoreserver <name> [all|roles|channels]` `listbackups` `autobackup`"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Type !showsettings any time to see this server's current configuration.")
+    return embed
+
+
+async def find_greetable_channel(guild: discord.Guild):
+    """Picks the best channel to post a one-time message in: the system channel if the bot
+    can talk there, otherwise the first text channel it can."""
+    if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
+        return guild.system_channel
+    return next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
+
+
 @bot.event
 async def on_guild_join(guild):
     """Fires the instant someone adds the bot to a new server."""
     if REQUIRE_OWNER_PRESENT and not await owner_in_guild(guild):
         await handle_unauthorized_guild(guild)
-    else:
-        await dm_owner(f"➕ Added to a new server: **{guild.name}** (`{guild.id}`).")
+        return
+
+    await dm_owner(f"➕ Added to a new server: **{guild.name}** (`{guild.id}`).")
+    channel = await find_greetable_channel(guild)
+    if channel:
+        try:
+            await channel.send(embed=build_setup_guide_embed(guild))
+        except discord.Forbidden:
+            pass
 
 
 @bot.event
@@ -457,7 +554,7 @@ async def on_raw_reaction_remove(payload):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setstarboardchannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's starboard channel. Usage: !setstarboardchannel #starboard"""
     set_guild_channel(ctx.guild.id, "starboard_channel", channel.id)
@@ -465,7 +562,7 @@ async def setstarboardchannel(ctx, channel: discord.TextChannel):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setstarboardthreshold(ctx, count: int):
     """Sets how many ⭐ reactions a message needs to hit the starboard in THIS server.
     Usage: !setstarboardthreshold 5 (default 3)"""
@@ -478,7 +575,7 @@ async def setstarboardthreshold(ctx, count: int):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_roles=True)
+@has_permissions_or_owner(manage_roles=True)
 async def reactionrole(ctx, message_id: int, emoji: str, role: discord.Role):
     """Link an emoji on a message to a role. Usage: !reactionrole <message_id> <emoji> @Role
     This is now saved permanently — it survives bot restarts."""
@@ -488,7 +585,7 @@ async def reactionrole(ctx, message_id: int, emoji: str, role: discord.Role):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_roles=True)
+@has_permissions_or_owner(manage_roles=True)
 async def removereactionrole(ctx, message_id: int, emoji: str):
     """Remove a reaction role pairing. Usage: !removereactionrole <message_id> <emoji>"""
     if str(message_id) in reaction_roles and emoji in reaction_roles[str(message_id)]:
@@ -500,7 +597,7 @@ async def removereactionrole(ctx, message_id: int, emoji: str):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_roles=True)
+@has_permissions_or_owner(manage_roles=True)
 async def createreactionrole(ctx, emoji: str, role: discord.Role, *, label: str = None):
     """Creates a brand-new reaction role message right here in Discord — no message ID needed,
     no editing bot.py. Usage: !createreactionrole 🎮 @Gamer Get pinged for game nights
@@ -531,7 +628,7 @@ async def createreactionrole(ctx, emoji: str, role: discord.Role, *, label: str 
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setavatar(ctx):
     """Sets a DIFFERENT bot avatar/pfp just for this server (Discord supports per-server bot avatars).
     Attach an image to this command's message. Needs Manage Server permission."""
@@ -547,7 +644,7 @@ async def setavatar(ctx):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setnickname(ctx, *, nickname: str):
     """Sets the bot's nickname for THIS server only. Usage: !setnickname Amiz. Needs Manage Server permission."""
     await ctx.guild.me.edit(nick=nickname)
@@ -559,7 +656,7 @@ async def setnickname(ctx, *, nickname: str):
 # welcome/goodbye/mod-log/timeout/level-up. Needs Manage Server permission to set.
 # ============================================================
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setwelcomechannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's welcome message channel. Usage: !setwelcomechannel #welcome"""
     set_guild_channel(ctx.guild.id, "welcome_channel", channel.id)
@@ -567,7 +664,7 @@ async def setwelcomechannel(ctx, channel: discord.TextChannel):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setgoodbyechannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's goodbye message channel. Usage: !setgoodbyechannel #goodbye"""
     set_guild_channel(ctx.guild.id, "goodbye_channel", channel.id)
@@ -575,7 +672,7 @@ async def setgoodbyechannel(ctx, channel: discord.TextChannel):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setmodlogchannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's mod-log channel. Usage: !setmodlogchannel #mod-log"""
     set_guild_channel(ctx.guild.id, "mod_log_channel", channel.id)
@@ -583,7 +680,7 @@ async def setmodlogchannel(ctx, channel: discord.TextChannel):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def settimeoutchannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's timeout channel (visible to timed-out members, they can't talk in it).
     Usage: !settimeoutchannel #timeout"""
@@ -592,7 +689,7 @@ async def settimeoutchannel(ctx, channel: discord.TextChannel):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setlevelupchannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's level-up announcement channel. Usage: !setlevelupchannel #levels
     If never set, level-up messages just post in whichever channel the person was chatting in."""
@@ -605,7 +702,7 @@ async def setlevelupchannel(ctx, channel: discord.TextChannel):
 # its OWN extra words to block. Needs Manage Server permission.
 # ============================================================
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def addbannedword(ctx, *, word: str):
     """Adds a word to THIS server's custom banned-word list (on top of the built-in filter).
     Usage: !addbannedword sometermsused"""
@@ -621,7 +718,7 @@ async def addbannedword(ctx, *, word: str):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def removebannedword(ctx, *, word: str):
     """Removes a word from THIS server's custom banned-word list. Usage: !removebannedword sometermsused"""
     word = word.lower().strip()
@@ -635,7 +732,7 @@ async def removebannedword(ctx, *, word: str):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def bannedwords(ctx):
     """Lists THIS server's custom banned words (not the built-in base filter)."""
     words = guild_settings.get(str(ctx.guild.id), {}).get("banned_words", [])
@@ -650,7 +747,7 @@ async def bannedwords(ctx):
 # configured PER SERVER. Needs Manage Server permission.
 # ============================================================
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setxpamount(ctx, amount: int):
     """Sets how much XP a message earns in THIS server. Usage: !setxpamount 20 (default 15)"""
     if amount < 1:
@@ -662,7 +759,7 @@ async def setxpamount(ctx, amount: int):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setvoicexpamount(ctx, amount: int):
     """Sets how much XP per minute members earn for being active in a voice channel in
     THIS server. Usage: !setvoicexpamount 5 (default 5). Set to 0 to disable voice XP here."""
@@ -675,7 +772,7 @@ async def setvoicexpamount(ctx, amount: int):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setlevelrole(ctx, level: int, role: discord.Role):
     """Sets a role to be auto-given when someone reaches a level, IN THIS SERVER ONLY.
     Usage: !setlevelrole 15 @Wizard — every server can use completely different levels/roles."""
@@ -687,7 +784,7 @@ async def setlevelrole(ctx, level: int, role: discord.Role):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def removelevelrole(ctx, level: int):
     """Removes a level-up role reward from THIS server. Usage: !removelevelrole 15"""
     level_roles = guild_settings.get(str(ctx.guild.id), {}).get("level_roles", {})
@@ -714,7 +811,7 @@ async def listlevelroles(ctx):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def setlevel(ctx, member: discord.Member, level: int):
     """Directly sets a member's level in THIS server (resets their XP progress to 0 for that
     level). Usage: !setlevel @someone 10"""
@@ -729,7 +826,7 @@ async def setlevel(ctx, member: discord.Member, level: int):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def addxp(ctx, member: discord.Member, amount: int):
     """Gives a member a specific amount of XP in THIS server (handles level-ups + role
     rewards the same as normal chat XP). Usage: !addxp @someone 500. Use a negative
@@ -806,18 +903,44 @@ async def on_guild_channel_create(channel):
             await channel.set_permissions(timeout_role, view_channel=False, send_messages=False, speak=False)
     except discord.Forbidden:
         pass
+    schedule_auto_backup(channel.guild)
 
 
 @bot.event
 async def on_guild_channel_delete(channel):
     moderator, reason = await get_audit_actor(channel.guild, discord.AuditLogAction.channel_delete, channel.id)
     await mod_log(channel.guild, "Channel Deleted", channel, moderator or "Unknown", f"#{channel.name} — {reason or 'No reason given'}", discord.Color.dark_red())
+    schedule_auto_backup(channel.guild)
+
+
+@bot.event
+async def on_guild_channel_update(before, after):
+    schedule_auto_backup(after.guild)
+
+
+@bot.event
+async def on_guild_role_create(role):
+    schedule_auto_backup(role.guild)
 
 
 @bot.event
 async def on_guild_role_delete(role):
     moderator, reason = await get_audit_actor(role.guild, discord.AuditLogAction.role_delete, role.id)
     await mod_log(role.guild, "Role Deleted", role, moderator or "Unknown", f"@{role.name} — {reason or 'No reason given'}", discord.Color.dark_red())
+    schedule_auto_backup(role.guild)
+
+
+@bot.event
+async def on_guild_role_update(before, after):
+    schedule_auto_backup(after.guild)
+
+
+@bot.event
+async def on_member_update(before, after):
+    # Only re-sync when the change is actually roles — this event also fires for nickname
+    # changes, avatar changes, etc, and those don't affect the backup at all.
+    if before.roles != after.roles:
+        schedule_auto_backup(after.guild)
 
 
 # ============================================================
@@ -882,7 +1005,7 @@ async def check_for_raid(member: discord.Member):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(administrator=True)
+@has_permissions_or_owner(administrator=True)
 async def lockdown(ctx):
     """Manually locks all text channels (stops @everyone from sending messages)."""
     global raid_mode_active
@@ -893,7 +1016,7 @@ async def lockdown(ctx):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(administrator=True)
+@has_permissions_or_owner(administrator=True)
 async def unlock(ctx):
     """Manually lifts a lockdown and turns off raid mode."""
     global raid_mode_active
@@ -1134,6 +1257,7 @@ def parse_birthday(text: str):
 
 
 @bot.hybrid_command()
+@discord.app_commands.describe(date="Your birthday as MM-DD, e.g. 04-20 (no year)")
 async def setbirthday(ctx, date: str):
     """Sets YOUR birthday (month + day only — no year). Usage: !setbirthday 04-20 or !setbirthday 04/20"""
     parsed = parse_birthday(date)
@@ -1146,6 +1270,7 @@ async def setbirthday(ctx, date: str):
 
 
 @bot.hybrid_command()
+@discord.app_commands.describe(member="Whose birthday to show (leave blank for your own)")
 async def birthday(ctx, member: discord.Member = None):
     """Shows your (or someone's) saved birthday."""
     member = member or ctx.author
@@ -1157,7 +1282,8 @@ async def birthday(ctx, member: discord.Member = None):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(channel="Channel where birthday announcements should post")
 async def setbirthdaychannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's birthday-announcement channel. Usage: !setbirthdaychannel #birthdays"""
     set_guild_channel(ctx.guild.id, "birthday_channel", channel.id)
@@ -1300,7 +1426,7 @@ def parse_duration(text: str):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def giveaway(ctx, duration: str, winners: int, *, prize: str):
     """Starts a giveaway. Usage: !giveaway 1h 1 Nitro Classic
     Duration examples: 30s, 10m, 2h, 1d, or combined like 1d12h."""
@@ -1364,7 +1490,7 @@ async def end_giveaway(message_id: str, data: dict):
         await message.edit(embed=ended_embed)
     except discord.Forbidden:
         pass
-    await channel.send(result_text)
+    await channel.send(embed=discord.Embed(description=result_text, color=discord.Color.gold()))
 
     giveaways_data.pop(message_id, None)
     save_json(GIVEAWAYS_FILE, giveaways_data)
@@ -1381,7 +1507,7 @@ async def giveaway_check():
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def gend(ctx, message_id: str):
     """Ends a giveaway early. Usage: !gend <message_id>"""
     data = giveaways_data.get(message_id)
@@ -1393,7 +1519,7 @@ async def gend(ctx, message_id: str):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def greroll(ctx, message_id: str):
     """Re-picks one winner for an ALREADY-ENDED giveaway. Run this in the same channel
     the giveaway was posted in. Usage: !greroll <message_id>"""
@@ -1632,21 +1758,21 @@ async def restore_roles(member: discord.Member, guild: discord.Guild):
 # MOD COMMANDS
 # ============================================================
 @bot.hybrid_command()
-@commands.has_permissions(moderate_members=True)
+@has_permissions_or_owner(moderate_members=True)
 async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reason given"):
     await custom_timeout(member, ctx.guild, minutes, reason, moderator=ctx.author)
     await ctx.send(embed=discord.Embed(description=f"🔇 {member.mention} has been timed out for {minutes} minute(s).\nReason: {reason}", color=discord.Color.orange()))
 
 
 @bot.hybrid_command()
-@commands.has_permissions(moderate_members=True)
+@has_permissions_or_owner(moderate_members=True)
 async def untimeout(ctx, member: discord.Member):
     await restore_roles(member, ctx.guild)
     await ctx.send(embed=discord.Embed(description=f"🔊 {member.mention}'s roles have been restored.", color=discord.Color.green()))
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_messages=True)
+@has_permissions_or_owner(manage_messages=True)
 async def clear(ctx, amount: int):
     """Deletes the last <amount> messages in this channel. Usage: !clear 20"""
     if amount < 1 or amount > 500:
@@ -1659,7 +1785,7 @@ async def clear(ctx, amount: int):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_messages=True)
+@has_permissions_or_owner(manage_messages=True)
 async def clearuser(ctx, member: discord.Member, amount: int = 100):
     """Deletes messages from a specific user (scans the last <amount> messages, default 100).
     Usage: !clearuser @user 50"""
@@ -1677,7 +1803,7 @@ async def clearuser(ctx, member: discord.Member, amount: int = 100):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(manage_messages=True)
+@has_permissions_or_owner(manage_messages=True)
 async def clearkeyword(ctx, keyword: str, amount: int = 100):
     """Deletes messages containing a specific word/phrase (scans the last <amount> messages, default 100).
     Usage: !clearkeyword "some phrase" 50"""
@@ -1697,10 +1823,10 @@ async def clearkeyword(ctx, keyword: str, amount: int = 100):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(kick_members=True)
+@has_permissions_or_owner(kick_members=True)
 async def kick(ctx, member: discord.Member, *, reason="No reason given"):
     try:
-        await member.send(f"👢 You were kicked from **{ctx.guild.name}**.\nReason: {reason}")
+        await member.send(embed=discord.Embed(description=f"👢 You were kicked from **{ctx.guild.name}**.\nReason: {reason}", color=discord.Color.red()))
     except discord.Forbidden:
         pass  # they have DMs off, can't be helped
     await member.kick(reason=reason)
@@ -1709,10 +1835,10 @@ async def kick(ctx, member: discord.Member, *, reason="No reason given"):
 
 
 @bot.hybrid_command()
-@commands.has_permissions(ban_members=True)
+@has_permissions_or_owner(ban_members=True)
 async def ban(ctx, member: discord.Member, *, reason="No reason given"):
     try:
-        await member.send(f"🔨 You were banned from **{ctx.guild.name}**.\nReason: {reason}")
+        await member.send(embed=discord.Embed(description=f"🔨 You were banned from **{ctx.guild.name}**.\nReason: {reason}", color=discord.Color.dark_red()))
     except discord.Forbidden:
         pass  # they have DMs off, can't be helped
     await member.ban(reason=reason)
@@ -1741,18 +1867,30 @@ def guild_backup_folder(guild_id):
     return folder
 
 
+def normalize_backup_name(name: str) -> str:
+    """Backup names are matched case-insensitively — 'Departure', 'departure', and 'DEPARTURE'
+    are all the same save. This normalized form is what's actually used as the filename."""
+    return name.strip().lower()
+
+
 def list_backup_names(guild_id):
-    return [f.replace(".json", "") for f in os.listdir(guild_backup_folder(guild_id)) if f.endswith(".json")]
+    """Returns the DISPLAY name (as it was originally typed) of every backup saved for this
+    server — even though the files on disk are keyed by the case-insensitive normalized name."""
+    folder = guild_backup_folder(guild_id)
+    names = []
+    for filename in os.listdir(folder):
+        if not filename.endswith(".json"):
+            continue
+        data = load_json(os.path.join(folder, filename))
+        names.append(data.get("display_name", filename[:-5]))
+    return names
 
 
-@bot.hybrid_command()
-@backup_permission()
-async def backupserver(ctx, backup_name: str):
-    """Saves this server's roles, channels (with permission overwrites), and who has which
-    custom role, to a file. Usage: !backupserver mybackup. Usable by you (the bot owner, in
-    any server) or by that server's own owner (for their own server only)."""
-    guild = ctx.guild
-    data = {"roles": [], "categories": [], "channels": [], "member_roles": {}}
+def build_backup_data(guild, display_name):
+    """Snapshots this server's current roles, categories, channels (with permission overwrites),
+    and who has which custom role. Shared by the manual !backupserver command and the automatic
+    background re-sync, so both always save in exactly the same shape."""
+    data = {"display_name": display_name, "roles": [], "categories": [], "channels": [], "member_roles": {}}
 
     # Roles (skip @everyone and the bot's own managed roles, bottom to top so restore order is right)
     for role in sorted(guild.roles, key=lambda r: r.position):
@@ -1803,24 +1941,152 @@ async def backupserver(ctx, backup_name: str):
         if member_role_names:
             data["member_roles"][str(member.id)] = member_role_names
 
-    path = os.path.join(guild_backup_folder(guild.id), f"{backup_name}.json")
+    return data
+
+
+def save_backup(guild, normalized_name, display_name):
+    """Builds and writes a backup to disk, returning the data that was saved."""
+    data = build_backup_data(guild, display_name)
+    path = os.path.join(guild_backup_folder(guild.id), f"{normalized_name}.json")
     save_json(path, data)
-    all_backups = list_backup_names(guild.id)
-    embed = discord.Embed(
-        title="💾 Server Backed Up",
-        description=(f"Saved as `{backup_name}` — {len(data['roles'])} roles, {len(data['categories'])} categories, "
-                      f"{len(data['channels'])} channels (with permissions), {len(data['member_roles'])} members' role assignments."),
-        color=discord.Color.green(),
-    )
-    embed.add_field(name="📁 Your saves", value=", ".join(f"`{b}`" for b in all_backups), inline=False)
-    await ctx.send(embed=embed)
+    return data
+
+
+# --- Auto-sync: once a server has a backup, keep it automatically current -------------------
+# Whenever !backupserver is run, that save becomes THIS server's "auto-synced" backup — from
+# then on, role/channel changes (made through Discord's UI OR the bot's own commands) quietly
+# re-save it in the background, so there's no need to keep re-running !backupserver by hand.
+# Only one save per server auto-syncs at a time (whichever was most recently backed up);
+# !autobackup off turns it off if you'd rather keep a save as a frozen snapshot instead.
+auto_backup_tasks = {}  # guild_id -> asyncio.Task, debounces bursts of role/channel events
+
+
+async def perform_auto_backup(guild):
+    settings = guild_settings.get(str(guild.id), {})
+    normalized = settings.get("auto_backup_name")
+    if not normalized:
+        return
+    path = os.path.join(guild_backup_folder(guild.id), f"{normalized}.json")
+    existing = load_json(path) if os.path.exists(path) else {}
+    display_name = existing.get("display_name", normalized)
+    save_backup(guild, normalized, display_name)
+
+
+async def _debounced_auto_backup(guild):
+    await asyncio.sleep(10)  # let a burst of changes (bulk edits, a restore) settle before saving
+    try:
+        await perform_auto_backup(guild)
+    except Exception as e:
+        print(f"⚠️ Auto-backup sync failed for {guild.name}: {e}")
+
+
+def schedule_auto_backup(guild):
+    """Call this from any event that changes server structure. No-ops if this server doesn't
+    have an auto-synced backup set up yet."""
+    if guild is None:
+        return
+    if not guild_settings.get(str(guild.id), {}).get("auto_backup_name"):
+        return
+    existing = auto_backup_tasks.get(guild.id)
+    if existing and not existing.done():
+        existing.cancel()
+    auto_backup_tasks[guild.id] = bot.loop.create_task(_debounced_auto_backup(guild))
 
 
 @bot.hybrid_command()
 @backup_permission()
-async def restoreserver(ctx, backup_name: str = None):
-    """Recreates roles/channels (with permissions) from a saved backup INTO THIS server, and
-    automatically re-assigns saved roles to any current member who had one. Usage: !restoreserver mybackup
+async def backupserver(ctx, backup_name: str):
+    """Saves this server's roles, channels (with permission overwrites), and who has which
+    custom role, to a file — and marks it as the save that stays automatically kept in sync
+    with future role/channel changes here. Usage: !backupserver mybackup. Usable by you (the
+    bot owner, in any server) or by that server's own owner (for their own server only)."""
+    guild = ctx.guild
+    normalized = normalize_backup_name(backup_name)
+    data = save_backup(guild, normalized, backup_name.strip())
+
+    guild_settings.setdefault(str(guild.id), {})["auto_backup_name"] = normalized
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+
+    all_backups = list_backup_names(guild.id)
+    embed = discord.Embed(
+        title="💾 Server Backed Up",
+        description=(f"Saved as `{data['display_name']}` — {len(data['roles'])} roles, {len(data['categories'])} categories, "
+                      f"{len(data['channels'])} channels (with permissions), {len(data['member_roles'])} members' role assignments."),
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="📁 Your saves", value=", ".join(f"`{b}`" for b in all_backups), inline=False)
+    embed.set_footer(text="🔄 This save now stays automatically synced with role/channel changes here — no need to re-run this manually. (Only the bot's creator can toggle auto-sync on/off.)")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+@owner_only()
+@discord.app_commands.describe(
+    mode="Turn auto-sync on for an existing backup, off, or just check status",
+    backup_name="Which saved backup to auto-sync (only needed for 'on')",
+)
+async def autobackup(ctx, mode: typing.Literal["status", "on", "off"] = "status", backup_name: str = None):
+    """Shows, enables, or disables which backup is kept automatically in sync with THIS
+    server's live roles/channels. Bot-creator only — server owners can still make and restore
+    backups with !backupserver / !restoreserver, but only you can flip auto-sync on or off.
+    Usage:
+      !autobackup                     — check what's currently auto-syncing
+      !autobackup on <name>           — turn auto-sync on for an existing backup
+      !autobackup off                 — turn auto-sync off"""
+    settings = guild_settings.get(str(ctx.guild.id), {})
+    current = settings.get("auto_backup_name")
+
+    if mode == "off":
+        guild_settings.setdefault(str(ctx.guild.id), {}).pop("auto_backup_name", None)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description="🛑 Turned off auto-sync for this server. Your existing saves are untouched.", color=discord.Color.orange()))
+        return
+
+    if mode == "on":
+        target = backup_name or current
+        if not target:
+            await ctx.send(embed=discord.Embed(description="Tell me which backup to auto-sync — e.g. `!autobackup on mybackup`. Run `!listbackups` to see your saves.", color=discord.Color.red()))
+            return
+        normalized = normalize_backup_name(target)
+        path = os.path.join(guild_backup_folder(ctx.guild.id), f"{normalized}.json")
+        if not os.path.exists(path):
+            all_backups = list_backup_names(ctx.guild.id)
+            await ctx.send(embed=discord.Embed(
+                description=f"❌ No backup found named `{target}`.\n📁 Your saves: {', '.join(f'`{b}`' for b in all_backups) if all_backups else '(none yet — use `!backupserver <name>` first)'}",
+                color=discord.Color.red(),
+            ))
+            return
+        guild_settings.setdefault(str(ctx.guild.id), {})["auto_backup_name"] = normalized
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        display_name = load_json(path).get("display_name", target)
+        await ctx.send(embed=discord.Embed(description=f"🔄 `{display_name}` will now stay automatically synced with this server's roles and channels.", color=discord.Color.green()))
+        return
+
+    # mode == "status"
+    if current:
+        await ctx.send(embed=discord.Embed(description=f"🔄 `{current}` is being kept automatically up to date with this server's roles and channels.", color=discord.Color.blurple()))
+    else:
+        await ctx.send(embed=discord.Embed(description="No backup is auto-syncing here right now — run `!autobackup on <name>` or `!backupserver <name>` to start one.", color=discord.Color.greyple()))
+
+
+@bot.hybrid_command()
+@backup_permission()
+@discord.app_commands.describe(
+    backup_name="Which saved backup to restore (leave blank to list your saves)",
+    what="Restore everything, or only roles, or only channels/categories",
+)
+async def restoreserver(
+    ctx,
+    backup_name: str = None,
+    what: typing.Literal["all", "roles", "channels"] = "all",
+):
+    """Recreates roles and/or channels (with permissions) from a saved backup INTO THIS server.
+    Usage: !restoreserver mybackup [all|roles|channels]
+    - all (default): roles + categories + channels + member role assignments
+    - roles: only recreates roles and re-assigns them to current members — no channels/categories
+    - channels: only recreates categories + channels (with permission overwrites) — no roles,
+      no member role re-assignment. If a channel's saved overwrite references a role that isn't
+      already in this server, that specific overwrite is just skipped.
     Run with no name to see your current saves. Usable by you (the bot owner, in any server) or by
     that server's own owner (for their own server only) — restores only pull from THIS server's saves.
     Only rebuilds structure + role assignments — does not restore messages."""
@@ -1831,11 +2097,11 @@ async def restoreserver(ctx, backup_name: str = None):
         if not all_backups:
             embed.description = "You don't have any backups saved yet — use `!backupserver <name>` first."
         else:
-            embed.description = "\n".join(f"- `{b}`" for b in all_backups) + "\n\nRun `!restoreserver <name>` to restore one."
+            embed.description = "\n".join(f"- `{b}`" for b in all_backups) + "\n\nRun `!restoreserver <name>` to restore one (add `roles` or `channels` to only restore part of it)."
         await ctx.send(embed=embed)
         return
 
-    path = os.path.join(guild_backup_folder(ctx.guild.id), f"{backup_name}.json")
+    path = os.path.join(guild_backup_folder(ctx.guild.id), f"{normalize_backup_name(backup_name)}.json")
     if not os.path.exists(path):
         embed = discord.Embed(
             description=f"❌ No backup found named `{backup_name}`.\n📁 Your saves: {', '.join(f'`{b}`' for b in all_backups) if all_backups else '(none yet)'}",
@@ -1846,73 +2112,94 @@ async def restoreserver(ctx, backup_name: str = None):
 
     data = load_json(path)
     guild = ctx.guild
-    await ctx.send(embed=discord.Embed(description=f"🔧 Restoring `{backup_name}` into **{guild.name}**... this may take a bit.", color=discord.Color.blurple()))
+    backup_name = data.get("display_name", backup_name)
+    restore_roles = what in ("all", "roles")
+    restore_channels = what in ("all", "channels")
+    what_label = {"all": "everything", "roles": "roles only", "channels": "channels only"}[what]
+    await ctx.send(embed=discord.Embed(description=f"🔧 Restoring `{backup_name}` ({what_label}) into **{guild.name}**... this may take a bit.", color=discord.Color.blurple()))
 
-    # Recreate roles first (bottom to top, matches saved order), keep a name -> role object map
+    # Recreate roles first (bottom to top, matches saved order), keep a name -> role object map.
+    # If we're not restoring roles this run, role_map stays empty — channel overwrites that
+    # reference a role by name simply get skipped below (they'll match existing roles by name
+    # if that role already exists in the server from a prior restore).
     role_map = {}
-    for role_data in data["roles"]:
-        new_role = await guild.create_role(
-            name=role_data["name"],
-            color=discord.Color(role_data["color"]),
-            permissions=discord.Permissions(role_data["permissions"]),
-            hoist=role_data["hoist"],
-            mentionable=role_data["mentionable"],
-            reason=f"Server restore from backup '{backup_name}'",
-        )
-        role_map[role_data["name"]] = new_role
+    if restore_roles:
+        for role_data in data["roles"]:
+            new_role = await guild.create_role(
+                name=role_data["name"],
+                color=discord.Color(role_data["color"]),
+                permissions=discord.Permissions(role_data["permissions"]),
+                hoist=role_data["hoist"],
+                mentionable=role_data["mentionable"],
+                reason=f"Server restore from backup '{backup_name}' (roles)",
+            )
+            role_map[role_data["name"]] = new_role
+    elif restore_channels:
+        # Channels-only restore: match overwrites against roles that already exist in this
+        # server by name, so a prior roles-only restore (or existing roles) still get wired up.
+        role_map = {role.name: role for role in guild.roles}
 
     # Recreate categories, keep a name -> object map for channel placement
     category_map = {}
-    for cat_data in data["categories"]:
-        cat = await guild.create_category(cat_data["name"], reason=f"Server restore from backup '{backup_name}'")
-        category_map[cat_data["name"]] = cat
+    if restore_channels:
+        for cat_data in data["categories"]:
+            cat = await guild.create_category(cat_data["name"], reason=f"Server restore from backup '{backup_name}' (channels)")
+            category_map[cat_data["name"]] = cat
 
     # Recreate channels into their categories, then re-apply saved permission overwrites
-    for chan_data in data["channels"]:
-        category = category_map.get(chan_data["category"])
-        if chan_data["type"] == "voice":
-            new_channel = await guild.create_voice_channel(chan_data["name"], category=category, reason=f"Server restore from backup '{backup_name}'")
-        else:
-            new_channel = await guild.create_text_channel(
-                chan_data["name"], category=category, topic=chan_data.get("topic"),
-                reason=f"Server restore from backup '{backup_name}'"
-            )
+    if restore_channels:
+        for chan_data in data["channels"]:
+            category = category_map.get(chan_data["category"])
+            if chan_data["type"] == "voice":
+                new_channel = await guild.create_voice_channel(chan_data["name"], category=category, reason=f"Server restore from backup '{backup_name}' (channels)")
+            else:
+                new_channel = await guild.create_text_channel(
+                    chan_data["name"], category=category, topic=chan_data.get("topic"),
+                    reason=f"Server restore from backup '{backup_name}' (channels)"
+                )
 
-        for ow in chan_data.get("overwrites", []):
-            target = guild.default_role if ow["role_name"] == "@everyone" else role_map.get(ow["role_name"])
-            if target is None:
-                continue
-            overwrite = discord.PermissionOverwrite.from_pair(
-                discord.Permissions(ow["allow"]), discord.Permissions(ow["deny"])
-            )
-            try:
-                await new_channel.set_permissions(target, overwrite=overwrite, reason=f"Server restore from backup '{backup_name}'")
-            except discord.Forbidden:
-                pass
+            for ow in chan_data.get("overwrites", []):
+                target = guild.default_role if ow["role_name"] == "@everyone" else role_map.get(ow["role_name"])
+                if target is None:
+                    continue
+                overwrite = discord.PermissionOverwrite.from_pair(
+                    discord.Permissions(ow["allow"]), discord.Permissions(ow["deny"])
+                )
+                try:
+                    await new_channel.set_permissions(target, overwrite=overwrite, reason=f"Server restore from backup '{backup_name}' (channels)")
+                except discord.Forbidden:
+                    pass
 
-    # Re-assign saved roles to any current member who had one
+    # Re-assign saved roles to any current member who had one — only relevant when roles were
+    # actually part of this restore.
     restored_members = 0
-    for member_id, role_names in data.get("member_roles", {}).items():
-        member = guild.get_member(int(member_id))
-        if member is None:
-            continue  # they're not in the server (anymore/yet) — nothing to restore for them
-        roles_to_add = [role_map[name] for name in role_names if name in role_map]
-        if roles_to_add:
-            try:
-                await member.add_roles(*roles_to_add, reason=f"Server restore from backup '{backup_name}'")
-                restored_members += 1
-            except discord.Forbidden:
-                pass
+    if restore_roles:
+        for member_id, role_names in data.get("member_roles", {}).items():
+            member = guild.get_member(int(member_id))
+            if member is None:
+                continue  # they're not in the server (anymore/yet) — nothing to restore for them
+            roles_to_add = [role_map[name] for name in role_names if name in role_map]
+            if roles_to_add:
+                try:
+                    await member.add_roles(*roles_to_add, reason=f"Server restore from backup '{backup_name}' (roles)")
+                    restored_members += 1
+                except discord.Forbidden:
+                    pass
+
+    summary_lines = []
+    if restore_roles:
+        summary_lines.append(f"Recreated {len(data['roles'])} roles.")
+        summary_lines.append(f"Re-assigned roles to {restored_members} member(s) currently in this server.")
+    if restore_channels:
+        summary_lines.append(f"Recreated {len(data['categories'])} categories and {len(data['channels'])} channels (with permissions).")
 
     embed = discord.Embed(
         title="✅ Restore Complete",
-        description=(f"Recreated {len(data['roles'])} roles, {len(data['categories'])} categories, "
-                      f"{len(data['channels'])} channels (with permissions).\n"
-                      f"Re-assigned roles to {restored_members} member(s) currently in this server."),
+        description="\n".join(summary_lines),
         color=discord.Color.green(),
     )
     await ctx.send(embed=embed)
-    await mod_log(guild, "Server Restored From Backup", guild.me, ctx.author, f"Backup: {backup_name}", discord.Color.blue())
+    await mod_log(guild, "Server Restored From Backup", guild.me, ctx.author, f"Backup: {backup_name} ({what_label})", discord.Color.blue())
 
 
 @bot.hybrid_command()
@@ -1925,6 +2212,115 @@ async def listbackups(ctx):
         await ctx.send(embed=discord.Embed(description="No backups saved yet.", color=discord.Color.greyple()))
     else:
         await ctx.send(embed=discord.Embed(title="💾 Saved Backups", description="\n".join(f"- `{f}`" for f in files), color=discord.Color.blurple()))
+
+
+# ============================================================
+# DATA RESILIENCE — export / import / auto-backup
+# ------------------------------------------------------------
+# Some hosts (Orihost included) wipe a bot's files on restart, redeploy, or "scheduled
+# cleanup" — that's a host-storage behavior, not something fixable from inside the bot.
+# The fix here is to keep a copy OFF the host: this section zips every save file (levels,
+# birthdays, warnings/settings, reaction roles, starboard, and every server backup) and DMs
+# it to you automatically on a schedule, plus lets you pull one manually or restore from one.
+# ============================================================
+DATA_FILES_FOR_EXPORT = [
+    ROLES_FILE, LEVELS_FILE, REACTION_ROLES_FILE, AFK_FILE,
+    GUILD_SETTINGS_FILE, BIRTHDAYS_FILE, GIVEAWAYS_FILE, STARBOARD_FILE,
+]
+
+
+def build_data_export_zip() -> io.BytesIO:
+    """Zips every JSON data file plus the whole backups/ folder (server structure backups)
+    into an in-memory file, ready to attach to a Discord message."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in DATA_FILES_FOR_EXPORT:
+            if os.path.exists(path):
+                zf.write(path, arcname=path)
+        for path in glob.glob(os.path.join(BACKUPS_FOLDER, "**", "*.json"), recursive=True):
+            zf.write(path, arcname=path)
+    buffer.seek(0)
+    return buffer
+
+
+def reload_all_data():
+    """Re-reads every persisted data file from disk, IN PLACE — clearing and refilling the
+    same dict objects every other part of the bot already holds a reference to, so an import
+    takes effect immediately without needing a restart."""
+    def refresh(target: dict, path: str):
+        target.clear()
+        target.update(load_json(path))
+
+    refresh(stored_roles, ROLES_FILE)
+    refresh(levels_data, LEVELS_FILE)
+    refresh(reaction_roles, REACTION_ROLES_FILE)
+    refresh(afk_data, AFK_FILE)
+    refresh(guild_settings, GUILD_SETTINGS_FILE)
+    refresh(birthdays_data, BIRTHDAYS_FILE)
+    refresh(giveaways_data, GIVEAWAYS_FILE)
+    refresh(starboard_data, STARBOARD_FILE)
+
+
+@bot.hybrid_command()
+@owner_only()
+async def exportdata(ctx):
+    """DMs you a zip of every save file — levels, birthdays, settings, reaction roles,
+    starboard, and every server backup — so you have a copy that survives a host wipe.
+    Usage: !exportdata"""
+    buffer = build_data_export_zip()
+    filename = f"backup_export_{datetime.datetime.utcnow().strftime('%Y-%m-%d_%H%M')}.zip"
+    try:
+        owner = await bot.fetch_user(OWNER_ID)
+        await owner.send(embed=discord.Embed(description="📦 Here's your full data export.", color=discord.Color.blurple()), file=discord.File(buffer, filename=filename))
+        if ctx.guild is not None:
+            await ctx.send(embed=discord.Embed(description="📦 Sent you a DM with the full backup zip.", color=discord.Color.green()))
+    except discord.Forbidden:
+        await ctx.send(embed=discord.Embed(description="⚠️ Couldn't DM you the export — check that your DMs are open, or run this command in a DM with me instead.", color=discord.Color.red()))
+
+
+@bot.hybrid_command()
+@owner_only()
+async def importdata(ctx, archive: discord.Attachment):
+    """Restores every save file from a zip made by !exportdata (or an auto-backup DM).
+    Attach the .zip to this command. THIS OVERWRITES your current data files — only run
+    this to recover after a wipe. Usage: !importdata (with the zip attached)"""
+    if not archive.filename.lower().endswith(".zip"):
+        await ctx.send(embed=discord.Embed(description="That doesn't look like a `.zip` export — attach the file `!exportdata` (or the auto-backup) sent you.", color=discord.Color.red()))
+        return
+
+    raw = await archive.read()
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            zf.extractall(".")
+    except zipfile.BadZipFile:
+        await ctx.send(embed=discord.Embed(description="⚠️ That zip file looks corrupted — try re-exporting or use an older backup DM.", color=discord.Color.red()))
+        return
+
+    reload_all_data()
+    await ctx.send(embed=discord.Embed(
+        title="✅ Data Restored",
+        description="Levels, birthdays, settings, reaction roles, starboard, and server backups have all been restored from that export and reloaded — no restart needed.",
+        color=discord.Color.green(),
+    ))
+
+
+@tasks.loop(hours=6)
+async def auto_data_backup():
+    """Every 6 hours, automatically DMs you a fresh data export — so even if you never run
+    !exportdata yourself, you've always got a recent off-host copy waiting in your DMs if
+    the host wipes the disk. Purely a safety net; costs nothing to leave running."""
+    try:
+        buffer = build_data_export_zip()
+        filename = f"auto_backup_{datetime.datetime.utcnow().strftime('%Y-%m-%d_%H%M')}.zip"
+        owner = await bot.fetch_user(OWNER_ID)
+        await owner.send(embed=discord.Embed(description="📦 Automatic data backup (every 6h) — keep this around in case the host wipes my files.", color=discord.Color.blurple()), file=discord.File(buffer, filename=filename))
+    except Exception as e:
+        print(f"⚠️ Auto data backup failed: {e}")
+
+
+@auto_data_backup.before_loop
+async def before_auto_data_backup():
+    await bot.wait_until_ready()
 
 
 bot.run(TOKEN)
