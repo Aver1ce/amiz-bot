@@ -401,7 +401,6 @@ async def on_guild_join(guild):
             pass
 
 
-@bot.event
 def describe_error(error: Exception):
     """Maps an exception to (SHORT_CODE, plain-English message) so people see something
     understandable instead of a raw Python error. Handles the common cases explicitly;
