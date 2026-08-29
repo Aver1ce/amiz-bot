@@ -2285,17 +2285,47 @@ async def autobackup(ctx, mode: typing.Literal["status", "on", "off"] = "status"
         await ctx.send(embed=discord.Embed(description="No backup is auto-syncing here right now — run `!autobackup on <name>` or `!backupserver <name>` to start one.", color=discord.Color.greyple()))
 
 
+def find_backup_matches(backup_name: str, from_server_hint: str = None):
+    """Searches EVERY server's backup folder for one matching this name (case-insensitively).
+    Used only for the bot owner's cross-server restore — a regular server owner only ever
+    looks inside their own server's folder. Returns a list of (guild_id_str, path) tuples;
+    if from_server_hint is given, only folders matching that guild's ID or name (substring,
+    case-insensitive) are considered."""
+    normalized = normalize_backup_name(backup_name)
+    matches = []
+    if not os.path.isdir(BACKUPS_FOLDER):
+        return matches
+    for guild_id_str in os.listdir(BACKUPS_FOLDER):
+        folder = os.path.join(BACKUPS_FOLDER, guild_id_str)
+        if not os.path.isdir(folder):
+            continue
+        path = os.path.join(folder, f"{normalized}.json")
+        if not os.path.exists(path):
+            continue
+        if from_server_hint:
+            hint = from_server_hint.strip().lower()
+            guild_obj = bot.get_guild(int(guild_id_str)) if guild_id_str.isdigit() else None
+            id_match = guild_id_str == from_server_hint.strip()
+            name_match = guild_obj is not None and hint in guild_obj.name.lower()
+            if not (id_match or name_match):
+                continue
+        matches.append((guild_id_str, path))
+    return matches
+
+
 @bot.hybrid_command()
 @commands.guild_only()
 @backup_permission()
 @discord.app_commands.describe(
     backup_name="Which saved backup to restore (leave blank to list your saves)",
     what="Restore everything, or only roles, or only channels/categories",
+    from_server="Bot-creator only: pull this backup from a DIFFERENT server (name or ID) than the one you're running this in",
 )
 async def restoreserver(
     ctx,
     backup_name: str = None,
     what: typing.Literal["all", "roles", "channels"] = "all",
+    from_server: str = None,
 ):
     """Recreates roles and/or channels (with permissions) from a saved backup INTO THIS server.
     Usage: !restoreserver mybackup [all|roles|channels]
@@ -2304,9 +2334,13 @@ async def restoreserver(
     - channels: only recreates categories + channels (with permission overwrites) — no roles,
       no member role re-assignment. If a channel's saved overwrite references a role that isn't
       already in this server, that specific overwrite is just skipped.
-    Run with no name to see your current saves. Usable by you (the bot owner, in any server) or by
-    that server's own owner (for their own server only) — restores only pull from THIS server's saves.
+    Run with no name to see your current saves. This server's own owner can only restore THIS
+    server's own saves, into THIS server. You (the bot creator) can restore ANY backup you've
+    ever made — from any server — into whatever server you run this in (handy for cloning a
+    setup into a brand-new server); if the same name exists in more than one server, add
+    `from_server` to say which one you mean.
     Only rebuilds structure + role assignments — does not restore messages."""
+    is_owner = ctx.author.id == OWNER_ID
     all_backups = list_backup_names(ctx.guild.id)
 
     if backup_name is None:
@@ -2315,13 +2349,37 @@ async def restoreserver(
             embed.description = "You don't have any backups saved yet — use `!backupserver <name>` first."
         else:
             embed.description = "\n".join(f"- `{b}`" for b in all_backups) + "\n\nRun `!restoreserver <name>` to restore one (add `roles` or `channels` to only restore part of it)."
+        if is_owner:
+            embed.set_footer(text="You can also pull a backup from a different server — add from_server to specify which one, or !listbackups to see everything you've saved everywhere.")
         await ctx.send(embed=embed)
         return
 
+    source_guild_id = ctx.guild.id
     path = os.path.join(guild_backup_folder(ctx.guild.id), f"{normalize_backup_name(backup_name)}.json")
+
+    if not os.path.exists(path) and is_owner:
+        # Not in this server's own folder — as the bot creator, search every server you've
+        # ever backed up, so you can clone a saved setup into a brand-new/different server.
+        matches = find_backup_matches(backup_name, from_server)
+        if len(matches) == 1:
+            guild_id_str, path = matches[0]
+            source_guild_id = int(guild_id_str)
+        elif len(matches) > 1:
+            options = []
+            for guild_id_str, _ in matches:
+                g = bot.get_guild(int(guild_id_str))
+                options.append(f"- `{g.name if g else 'Unknown server'}` (`{guild_id_str}`)")
+            await ctx.send(embed=discord.Embed(
+                title="⚠️ Found that name in multiple servers",
+                description=f"`{backup_name}` exists in more than one place:\n" + "\n".join(options) + "\n\nRe-run with `from_server` set to the name or ID of the one you want.",
+                color=discord.Color.orange(),
+            ))
+            return
+
     if not os.path.exists(path):
+        hint = " (checked every server you've backed up too)" if is_owner else ""
         embed = discord.Embed(
-            description=f"❌ No backup found named `{backup_name}`.\n📁 Your saves: {', '.join(f'`{b}`' for b in all_backups) if all_backups else '(none yet)'}",
+            description=f"❌ No backup found named `{backup_name}`{hint}.\n📁 Your saves here: {', '.join(f'`{b}`' for b in all_backups) if all_backups else '(none yet)'}",
             color=discord.Color.red(),
         )
         await ctx.send(embed=embed)
@@ -2333,7 +2391,12 @@ async def restoreserver(
     restore_roles = what in ("all", "roles")
     restore_channels = what in ("all", "channels")
     what_label = {"all": "everything", "roles": "roles only", "channels": "channels only"}[what]
-    await ctx.send(embed=discord.Embed(description=f"🔧 Restoring `{backup_name}` ({what_label}) into **{guild.name}**... this may take a bit.", color=discord.Color.blurple()))
+
+    cross_server_note = ""
+    if source_guild_id != ctx.guild.id:
+        source_guild = bot.get_guild(source_guild_id)
+        cross_server_note = f" (cloned from **{source_guild.name if source_guild else source_guild_id}**)"
+    await ctx.send(embed=discord.Embed(description=f"🔧 Restoring `{backup_name}`{cross_server_note} ({what_label}) into **{guild.name}**... this may take a bit.", color=discord.Color.blurple()))
 
     # Recreate roles first (bottom to top, matches saved order), keep a name -> role object map.
     # If we're not restoring roles this run, role_map stays empty — channel overwrites that
@@ -2416,7 +2479,7 @@ async def restoreserver(
         color=discord.Color.green(),
     )
     await ctx.send(embed=embed)
-    await mod_log(guild, "Server Restored From Backup", guild.me, ctx.author, f"Backup: {backup_name} ({what_label})", discord.Color.blue())
+    await mod_log(guild, "Server Restored From Backup", guild.me, ctx.author, f"Backup: {backup_name} ({what_label}){cross_server_note}", discord.Color.blue())
 
 
 @bot.hybrid_command()
@@ -2562,6 +2625,29 @@ async def broadcast(ctx, *, message: str):
 # no undo beyond restoring a backup made BEFORE running one of these (!backupserver /
 # !restoreserver). !anniserver asks for typed confirmation first since it wipes everything.
 # ============================================================
+@bot.hybrid_command()
+@commands.guild_only()
+@owner_only()
+@discord.app_commands.describe(role="The role to permanently delete")
+async def annirole(ctx, role: discord.Role):
+    """Bot-creator only. Permanently deletes a single role — gone, not archived.
+    Usage: !annirole @SomeRole"""
+    if role.is_default():
+        await ctx.send(embed=discord.Embed(description="Can't delete `@everyone` — it isn't a real role, just the server's base permission set.", color=discord.Color.red()))
+        return
+
+    name = role.name
+    guilds_in_bulk_delete.add(ctx.guild.id)  # suppress the normal single-role mod-log DM, we send our own summary below
+    try:
+        await role.delete(reason=f"Annihilated by bot owner ({ctx.author})")
+    except discord.Forbidden:
+        guilds_in_bulk_delete.discard(ctx.guild.id)
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — NO_PERMISSION", description="I don't have permission to delete that role — it may be managed by an integration, or above my own role in the list.", color=discord.Color.red()))
+        return
+    guilds_in_bulk_delete.discard(ctx.guild.id)
+    await ctx.send(embed=discord.Embed(description=f"💥 Deleted role `@{name}`.", color=discord.Color.dark_red()))
+
+
 @bot.hybrid_command()
 @commands.guild_only()
 @owner_only()
