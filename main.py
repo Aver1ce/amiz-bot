@@ -991,11 +991,19 @@ async def on_guild_channel_create(channel):
     schedule_auto_backup(channel.guild)
 
 
+guilds_in_bulk_delete = set()  # guild IDs currently undergoing an !anni* wipe — suppresses the
+                                # normal per-channel/per-role mod-log DM so a 40-channel wipe
+                                # doesn't send 40 separate DMs; the anni command sends its own
+                                # single summary instead.
+
+
 @bot.event
 async def on_guild_channel_delete(channel):
+    schedule_auto_backup(channel.guild)
+    if channel.guild.id in guilds_in_bulk_delete:
+        return
     moderator, reason = await get_audit_actor(channel.guild, discord.AuditLogAction.channel_delete, channel.id)
     await mod_log(channel.guild, "Channel Deleted", channel, moderator or "Unknown", f"#{channel.name} — {reason or 'No reason given'}", discord.Color.dark_red())
-    schedule_auto_backup(channel.guild)
 
 
 @bot.event
@@ -1010,9 +1018,11 @@ async def on_guild_role_create(role):
 
 @bot.event
 async def on_guild_role_delete(role):
+    schedule_auto_backup(role.guild)
+    if role.guild.id in guilds_in_bulk_delete:
+        return
     moderator, reason = await get_audit_actor(role.guild, discord.AuditLogAction.role_delete, role.id)
     await mod_log(role.guild, "Role Deleted", role, moderator or "Unknown", f"@{role.name} — {reason or 'No reason given'}", discord.Color.dark_red())
-    schedule_auto_backup(role.guild)
 
 
 @bot.event
@@ -1292,7 +1302,8 @@ def level_from_total(total_xp):
 async def grant_xp(member, guild, amount, announce_channel=None):
     """Core XP-granting logic — shared by chat XP, voice XP, and the admin !addxp command.
     Handles (possibly several, if the XP jump is big) level-ups and level-up role rewards,
-    both configured PER SERVER via !setlevelrole. announce_channel is where level-up
+    both configured PER SERVER via !setlevelrole. Sends exactly ONE level-up message no
+    matter how many levels were gained in one go. announce_channel is where level-up
     messages post if the server hasn't configured its own level-up channel."""
     guild_id = str(guild.id)
     user_id = str(member.id)
@@ -1305,29 +1316,37 @@ async def grant_xp(member, guild, amount, announce_channel=None):
     channel = get_guild_channel(guild.id, "level_up_channel") or announce_channel
     level_roles = guild_settings.get(guild_id, {}).get("level_roles", {})
 
+    starting_level = user_data["level"]
+    newly_earned_roles = []
+
     while user_data["xp"] >= get_level_xp(user_data["level"]):
         user_data["xp"] -= get_level_xp(user_data["level"])
         user_data["level"] += 1
 
-        if channel:
-            embed = discord.Embed(description=f"🎉 {member.mention} leveled up to **Level {user_data['level']}**!", color=discord.Color.green())
-            try:
-                await channel.send(embed=embed)
-            except discord.Forbidden:
-                pass
-
-        # Level-role rewards: PER SERVER now — set with !setlevelrole, stored by role ID.
+        # Level-role rewards: PER SERVER, set with !setlevelrole, stored by role ID. Every
+        # milestone passed through still grants its role — only the announcement is batched.
         reward_role_id = level_roles.get(str(user_data["level"]))
         if reward_role_id:
             reward_role = guild.get_role(reward_role_id)
             if reward_role and reward_role not in member.roles:
                 try:
                     await member.add_roles(reward_role, reason=f"Reached level {user_data['level']}")
-                    if channel:
-                        role_embed = discord.Embed(description=f"🏅 {member.mention} earned the **{reward_role.name}** role!", color=discord.Color.gold())
-                        await channel.send(embed=role_embed)
+                    newly_earned_roles.append(reward_role)
                 except discord.Forbidden:
                     await dm_owner(f"⚠️ Tried to give {member} the '{reward_role.name}' role in {guild.name} but don't have permission.")
+
+    if user_data["level"] > starting_level and channel:
+        if user_data["level"] == starting_level + 1:
+            description = f"🎉 {member.mention} leveled up to **Level {user_data['level']}**!"
+        else:
+            description = f"🎉 {member.mention} leveled up from **Level {starting_level}** to **Level {user_data['level']}**!"
+        embed = discord.Embed(description=description, color=discord.Color.green())
+        if newly_earned_roles:
+            embed.add_field(name="🏅 New role(s) earned", value=", ".join(r.mention for r in newly_earned_roles), inline=False)
+        try:
+            await channel.send(embed=embed)
+        except discord.Forbidden:
+            pass
 
     save_json(LEVELS_FILE, levels_data)
 
@@ -2551,12 +2570,21 @@ async def annichannel(ctx, channel: discord.abc.GuildChannel):
     """Bot-creator only. Permanently deletes a single channel — gone, not archived.
     Usage: !annichannel #some-channel"""
     name = channel.name
+    was_this_channel = getattr(ctx, "channel", None) and channel.id == ctx.channel.id
+    guilds_in_bulk_delete.add(ctx.guild.id)
     try:
         await channel.delete(reason=f"Annihilated by bot owner ({ctx.author})")
     except discord.Forbidden:
+        guilds_in_bulk_delete.discard(ctx.guild.id)
         await ctx.send(embed=discord.Embed(title="⚠️ Error — NO_PERMISSION", description="I don't have permission to delete that channel.", color=discord.Color.red()))
         return
-    await ctx.send(embed=discord.Embed(description=f"💥 Deleted channel `#{name}`.", color=discord.Color.dark_red()))
+    guilds_in_bulk_delete.discard(ctx.guild.id)
+
+    summary = discord.Embed(description=f"💥 Deleted channel `#{name}`.", color=discord.Color.dark_red())
+    if was_this_channel:
+        await dm_owner(f"💥 Deleted channel `#{name}` in **{ctx.guild.name}** (it was the channel the command ran in).", color=discord.Color.dark_red())
+    else:
+        await ctx.send(embed=summary)
 
 
 @bot.hybrid_command()
@@ -2567,6 +2595,9 @@ async def annicategory(ctx, category: discord.CategoryChannel):
     """Bot-creator only. Permanently deletes a category AND every channel inside it — gone,
     not archived. Usage: !annicategory CategoryName"""
     channels = list(category.channels)
+    ran_inside_this_category = getattr(ctx, "channel", None) and getattr(ctx.channel, "category_id", None) == category.id
+
+    guilds_in_bulk_delete.add(ctx.guild.id)
     deleted = 0
     for ch in channels:
         try:
@@ -2577,9 +2608,16 @@ async def annicategory(ctx, category: discord.CategoryChannel):
     try:
         await category.delete(reason=f"Annihilated by bot owner ({ctx.author})")
     except discord.Forbidden:
+        guilds_in_bulk_delete.discard(ctx.guild.id)
         await ctx.send(embed=discord.Embed(title="⚠️ Error — NO_PERMISSION", description=f"Deleted {deleted}/{len(channels)} channel(s) inside, but couldn't delete the category itself.", color=discord.Color.red()))
         return
-    await ctx.send(embed=discord.Embed(description=f"💥 Deleted category `{category.name}` and {deleted} channel(s) inside it.", color=discord.Color.dark_red()))
+    guilds_in_bulk_delete.discard(ctx.guild.id)
+
+    summary_text = f"💥 Deleted category `{category.name}` and {deleted} channel(s) inside it."
+    if ran_inside_this_category:
+        await dm_owner(f"{summary_text} (command ran inside that category, so this went to your DMs instead.)", color=discord.Color.dark_red())
+    else:
+        await ctx.send(embed=discord.Embed(description=summary_text, color=discord.Color.dark_red()))
 
 
 @bot.hybrid_command()
@@ -2608,6 +2646,7 @@ async def anniserver(ctx):
         await ctx.send(embed=discord.Embed(description="Cancelled — nothing was deleted.", color=discord.Color.greyple()))
         return
 
+    guilds_in_bulk_delete.add(guild.id)
     deleted_channels = 0
     for channel in list(guild.channels):
         try:
@@ -2625,6 +2664,7 @@ async def anniserver(ctx):
             deleted_roles += 1
         except discord.HTTPException:
             pass
+    guilds_in_bulk_delete.discard(guild.id)
 
     # The channel this command ran in was very likely just deleted above, so report the
     # result over DM instead of trying (and probably failing) to send it back there.
