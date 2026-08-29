@@ -275,7 +275,7 @@ async def mod_log(guild: discord.Guild, action: str, target, moderator, reason: 
     """Posts a clean embed to the mod-log channel recording who did what to whom and why.
     Also DMs the owner a short version so nothing gets missed."""
     channel = get_guild_channel(guild.id, "mod_log_channel")
-    embed = discord.Embed(title=f"🛡️ {action}", color=color, timestamp=datetime.datetime.utcnow())
+    embed = discord.Embed(title=f"🛡️ {action}", color=color, timestamp=datetime.datetime.now(datetime.timezone.utc))
     embed.add_field(name="Target", value=f"{target} (`{target.id}`)", inline=True)
     embed.add_field(name="Moderator", value=f"{moderator} (`{moderator.id}`)", inline=True)
     embed.add_field(name="Reason", value=reason, inline=False)
@@ -646,7 +646,8 @@ async def setavatar(ctx):
 @bot.hybrid_command()
 @has_permissions_or_owner(manage_guild=True)
 async def setnickname(ctx, *, nickname: str):
-    """Sets the bot's nickname for THIS server only. Usage: !setnickname Amiz. Needs Manage Server permission."""
+    """Sets the bot's nickname for THIS server only. Needs Manage Server permission.
+    Usage: !setnickname Amiz"""
     await ctx.guild.me.edit(nick=nickname)
     await ctx.send(embed=discord.Embed(description=f"✅ Nickname set to **{nickname}** for this server.", color=discord.Color.green()))
 
@@ -974,7 +975,7 @@ async def unlock_all_channels(guild: discord.Guild):
 
 async def check_for_raid(member: discord.Member):
     global raid_mode_active
-    now = datetime.datetime.utcnow().timestamp()
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
     recent_joins.append(now)
     while recent_joins and now - recent_joins[0] > RAID_WINDOW_SECONDS:
@@ -991,7 +992,7 @@ async def check_for_raid(member: discord.Member):
 
     # --- While raid mode is active, auto-kick/ban new accounts joining ---
     if raid_mode_active:
-        account_age_days = (datetime.datetime.utcnow() - member.created_at.replace(tzinfo=None)).days
+        account_age_days = (datetime.datetime.now(datetime.timezone.utc) - member.created_at).days
         if account_age_days < MIN_ACCOUNT_AGE_DAYS:
             reason = f"Anti-raid: account is only {account_age_days} day(s) old, joined during active raid"
             try:
@@ -1053,7 +1054,7 @@ async def afk(ctx, *, activity: str = "AFK"):
     """Marks you as AFK. Usage: !afk sleeping
     Anyone who pings or replies to you will be told you're away, what you're doing,
     and how long you've been gone. Clears automatically the next time you send a message."""
-    afk_data[str(ctx.author.id)] = {"activity": activity, "since": datetime.datetime.utcnow().timestamp()}
+    afk_data[str(ctx.author.id)] = {"activity": activity, "since": datetime.datetime.now(datetime.timezone.utc).timestamp()}
     save_json(AFK_FILE, afk_data)
     embed = discord.Embed(description=f"**{activity}**", color=discord.Color.greyple())
     embed.set_author(name=f"{ctx.author.display_name} is now AFK", icon_url=ctx.author.display_avatar.url)
@@ -1069,7 +1070,7 @@ async def handle_afk(message: discord.Message):
         since = afk_data[user_id]["since"]
         del afk_data[user_id]
         save_json(AFK_FILE, afk_data)
-        duration = format_duration(datetime.datetime.utcnow().timestamp() - since)
+        duration = format_duration(datetime.datetime.now(datetime.timezone.utc).timestamp() - since)
         welcome_embed = discord.Embed(description=f"Welcome back — you were away for **{duration}**.", color=discord.Color.green())
         welcome_embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
         await message.channel.send(embed=welcome_embed, delete_after=8)
@@ -1087,7 +1088,7 @@ async def handle_afk(message: discord.Message):
             continue
         target_data = afk_data.get(str(target.id))
         if target_data:
-            duration = format_duration(datetime.datetime.utcnow().timestamp() - target_data["since"])
+            duration = format_duration(datetime.datetime.now(datetime.timezone.utc).timestamp() - target_data["since"])
             embed = discord.Embed(description=f"**{target_data['activity']}** — away for {duration}", color=discord.Color.greyple())
             embed.set_author(name=f"{target.display_name} is AFK", icon_url=target.display_avatar.url)
             await message.channel.send(embed=embed)
@@ -1165,7 +1166,7 @@ async def add_xp(message):
     guild_id = str(message.guild.id)
     user_id = str(message.author.id)
     cooldown_key = f"{guild_id}:{user_id}"
-    now = datetime.datetime.utcnow().timestamp()
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
     if now - xp_cooldowns.get(cooldown_key, 0) < XP_COOLDOWN_SECONDS:
         return
@@ -1209,18 +1210,18 @@ async def on_voice_state_update(member, before, after):
     now_active = channel_counts_as_active(after.channel)
 
     if was_active and key in voice_sessions:
-        elapsed_minutes = (datetime.datetime.utcnow().timestamp() - voice_sessions.pop(key)) / 60
+        elapsed_minutes = (datetime.datetime.now(datetime.timezone.utc).timestamp() - voice_sessions.pop(key)) / 60
         await award_voice_xp(member.guild, member, elapsed_minutes)
 
     if now_active:
-        voice_sessions[key] = datetime.datetime.utcnow().timestamp()
+        voice_sessions[key] = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
 
 @tasks.loop(minutes=VOICE_XP_CHECK_INTERVAL_MINUTES)
 async def voice_xp_checkpoint():
     """Periodically pays out XP for everyone still actively in voice, so long sessions
     accrue XP without waiting for someone to leave the channel."""
-    now = datetime.datetime.utcnow().timestamp()
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
     for key in list(voice_sessions.keys()):
         guild_id_str, user_id_str = key.split(":")
         guild = bot.get_guild(int(guild_id_str))
@@ -1294,7 +1295,7 @@ async def setbirthdaychannel(ctx, channel: discord.TextChannel):
 async def birthday_check():
     """Runs once a day. For every server with a birthday channel set, announces any current
     member whose saved birthday is today."""
-    today = datetime.datetime.utcnow().strftime("%m-%d")
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%m-%d")
     birthday_users = {uid for uid, bday in birthdays_data.items() if bday == today}
     if not birthday_users:
         return
@@ -1438,7 +1439,7 @@ async def giveaway(ctx, duration: str, winners: int, *, prize: str):
         await ctx.send(embed=discord.Embed(description="Needs at least 1 winner.", color=discord.Color.red()))
         return
 
-    end_time = datetime.datetime.utcnow().timestamp() + seconds
+    end_time = datetime.datetime.now(datetime.timezone.utc).timestamp() + seconds
     embed = discord.Embed(
         title="🎉 GIVEAWAY 🎉",
         description=(f"**{prize}**\n\nReact with 🎉 to enter!\n"
@@ -1498,7 +1499,7 @@ async def end_giveaway(message_id: str, data: dict):
 
 @tasks.loop(seconds=30)
 async def giveaway_check():
-    now = datetime.datetime.utcnow().timestamp()
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
     ended = [mid for mid, data in giveaways_data.items() if data["end_time"] <= now]
     for message_id in ended:
         data = giveaways_data.get(message_id)
@@ -1643,36 +1644,37 @@ async def on_message(message):
     if REQUIRE_OWNER_PRESENT and not await owner_in_guild(message.guild):
         return  # bricked — owner isn't in this server, do nothing at all
 
-    content_lower = message.content.lower()
+    # Everything in this block is server-only moderation/leveling logic — message.guild is
+    # None for DMs, so none of it applies (and touching message.guild.id there would crash).
+    if message.guild is not None:
+        if contains_banned_word(message.content, message.guild.id):
+            await message.delete()
+            await message.channel.send(embed=discord.Embed(description=f"{message.author.mention}, that language isn't allowed here.", color=discord.Color.red()), delete_after=5)
+            await dm_owner(f"🚫 Deleted a message from **{message.author}** in #{message.channel} (banned word):\n> {message.content}")
+            return
 
-    if contains_banned_word(message.content, message.guild.id):
-        await message.delete()
-        await message.channel.send(embed=discord.Embed(description=f"{message.author.mention}, that language isn't allowed here.", color=discord.Color.red()), delete_after=5)
-        await dm_owner(f"🚫 Deleted a message from **{message.author}** in #{message.channel} (banned word):\n> {message.content}")
-        return
+        if len(message.mentions) >= 5:
+            await message.delete()
+            await message.channel.send(embed=discord.Embed(description=f"{message.author.mention}, mass-pinging isn't allowed.", color=discord.Color.red()), delete_after=5)
+            await dm_owner(f"🚫 Deleted a mass-mention message from **{message.author}** in #{message.channel}")
+            return
 
-    if len(message.mentions) >= 5:
-        await message.delete()
-        await message.channel.send(embed=discord.Embed(description=f"{message.author.mention}, mass-pinging isn't allowed.", color=discord.Color.red()), delete_after=5)
-        await dm_owner(f"🚫 Deleted a mass-mention message from **{message.author}** in #{message.channel}")
-        return
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        timestamps = [t for t in spam_tracker.get(message.author.id, []) if now - t < SPAM_SECONDS]
+        timestamps.append(now)
+        spam_tracker[message.author.id] = timestamps
 
-    now = datetime.datetime.utcnow().timestamp()
-    timestamps = [t for t in spam_tracker.get(message.author.id, []) if now - t < SPAM_SECONDS]
-    timestamps.append(now)
-    spam_tracker[message.author.id] = timestamps
+        if len(timestamps) > SPAM_LIMIT:
+            spam_tracker[message.author.id] = []
+            try:
+                await custom_timeout(message.author, message.guild, minutes=5, reason="Spamming")
+                await message.channel.send(embed=discord.Embed(description=f"⏱️ {message.author.mention} was timed out for spamming.", color=discord.Color.orange()))
+            except Exception as e:
+                await dm_owner(f"⚠️ Failed to auto-timeout {message.author}: {e}")
+            return
 
-    if len(timestamps) > SPAM_LIMIT:
-        spam_tracker[message.author.id] = []
-        try:
-            await custom_timeout(message.author, message.guild, minutes=5, reason="Spamming")
-            await message.channel.send(embed=discord.Embed(description=f"⏱️ {message.author.mention} was timed out for spamming.", color=discord.Color.orange()))
-        except Exception as e:
-            await dm_owner(f"⚠️ Failed to auto-timeout {message.author}: {e}")
-        return
-
-    await add_xp(message)
-    await handle_afk(message)
+        await add_xp(message)
+        await handle_afk(message)
 
     is_mentioned = bot.user in message.mentions
     is_reply_to_bot = (
@@ -2301,7 +2303,7 @@ async def exportdata(ctx):
     starboard, and every server backup — so you have a copy that survives a host wipe.
     Usage: !exportdata"""
     buffer = build_data_export_zip()
-    filename = f"backup_export_{datetime.datetime.utcnow().strftime('%Y-%m-%d_%H%M')}.zip"
+    filename = f"backup_export_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d_%H%M')}.zip"
     try:
         owner = await bot.fetch_user(OWNER_ID)
         await owner.send(embed=discord.Embed(description="📦 Here's your full data export.", color=discord.Color.blurple()), file=discord.File(buffer, filename=filename))
@@ -2344,7 +2346,7 @@ async def auto_data_backup():
     the host wipes the disk. Purely a safety net; costs nothing to leave running."""
     try:
         buffer = build_data_export_zip()
-        filename = f"auto_backup_{datetime.datetime.utcnow().strftime('%Y-%m-%d_%H%M')}.zip"
+        filename = f"auto_backup_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d_%H%M')}.zip"
         owner = await bot.fetch_user(OWNER_ID)
         await owner.send(embed=discord.Embed(description="📦 Automatic data backup (every 6h) — keep this around in case the host wipes my files.", color=discord.Color.blurple()), file=discord.File(buffer, filename=filename))
     except Exception as e:
