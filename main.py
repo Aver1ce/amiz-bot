@@ -1258,6 +1258,12 @@ def parse_birthday(text: str):
         return None
 
 
+def format_birthday(mmdd: str) -> str:
+    """Turns a stored 'MM-DD' into a friendly form like 'May 14' for display."""
+    parsed = datetime.datetime.strptime(mmdd, "%m-%d")
+    return f"{parsed.strftime('%B')} {parsed.day}"
+
+
 @bot.hybrid_command()
 @discord.app_commands.describe(date="Your birthday as MM-DD, e.g. 04-20 (no year)")
 async def setbirthday(ctx, date: str):
@@ -1268,7 +1274,7 @@ async def setbirthday(ctx, date: str):
         return
     birthdays_data[str(ctx.author.id)] = parsed
     save_json(BIRTHDAYS_FILE, birthdays_data)
-    await ctx.send(embed=discord.Embed(description=f"🎂 Got it — your birthday is set to **{parsed}**.", color=discord.Color.green()))
+    await ctx.send(embed=discord.Embed(description=f"🎂 Got it — your birthday is set to **{format_birthday(parsed)}**.", color=discord.Color.green()))
 
 
 @bot.hybrid_command()
@@ -1280,7 +1286,7 @@ async def birthday(ctx, member: discord.Member = None):
     if not saved:
         await ctx.send(embed=discord.Embed(description=f"{member.mention} hasn't set a birthday yet." if member != ctx.author else "You haven't set a birthday yet — use `!setbirthday MM-DD`.", color=discord.Color.greyple()))
         return
-    await ctx.send(embed=discord.Embed(description=f"🎂 {member.mention}'s birthday is **{saved}**.", color=discord.Color.blurple()))
+    await ctx.send(embed=discord.Embed(description=f"🎂 {member.mention}'s birthday is **{format_birthday(saved)}**.", color=discord.Color.blurple()))
 
 
 @bot.hybrid_command()
@@ -2208,13 +2214,57 @@ async def restoreserver(
 @bot.hybrid_command()
 @backup_permission()
 async def listbackups(ctx):
-    """Lists all backups saved from THIS server. Usable by you (the bot owner) or this
-    server's own owner."""
+    """Lists backups. This server's own owner sees just THIS server's saves. You (the bot
+    creator) see EVERY backup you've ever made across every server, and which one (if any)
+    is currently auto-syncing in each."""
+    if ctx.author.id == OWNER_ID:
+        guild_folders = []
+        if os.path.isdir(BACKUPS_FOLDER):
+            guild_folders = sorted(d for d in os.listdir(BACKUPS_FOLDER) if os.path.isdir(os.path.join(BACKUPS_FOLDER, d)))
+
+        embed = discord.Embed(title="💾 All Backups (every server)", color=discord.Color.blurple())
+        total = 0
+        for guild_id_str in guild_folders:
+            folder = os.path.join(BACKUPS_FOLDER, guild_id_str)
+            json_files = [f for f in os.listdir(folder) if f.endswith(".json")]
+            if not json_files:
+                continue
+            if len(embed.fields) >= 25:
+                break  # Discord embeds cap out at 25 fields — extremely unlikely to hit this
+            guild_obj = bot.get_guild(int(guild_id_str))
+            guild_label = guild_obj.name if guild_obj else f"Unknown/left server (`{guild_id_str}`)"
+            auto_name = guild_settings.get(guild_id_str, {}).get("auto_backup_name")
+
+            lines = []
+            for filename in sorted(json_files):
+                normalized = filename[:-5]
+                data = load_json(os.path.join(folder, filename))
+                display = data.get("display_name", normalized)
+                synced = " 🔄" if auto_name == normalized else ""
+                lines.append(f"- `{display}`{synced}")
+                total += 1
+            embed.add_field(name=guild_label, value="\n".join(lines), inline=False)
+
+        if total == 0:
+            await ctx.send(embed=discord.Embed(description="No backups saved anywhere yet.", color=discord.Color.greyple()))
+            return
+        embed.set_footer(text=f"{total} backup(s) across {len(embed.fields)} server(s). 🔄 = currently auto-syncing")
+        await ctx.send(embed=embed)
+        return
+
+    # This server's own owner: just this server's saves, same as before.
     files = list_backup_names(ctx.guild.id)
     if not files:
         await ctx.send(embed=discord.Embed(description="No backups saved yet.", color=discord.Color.greyple()))
-    else:
-        await ctx.send(embed=discord.Embed(title="💾 Saved Backups", description="\n".join(f"- `{f}`" for f in files), color=discord.Color.blurple()))
+        return
+    auto_name = guild_settings.get(str(ctx.guild.id), {}).get("auto_backup_name")
+    lines = []
+    for f in files:
+        synced = " 🔄" if auto_name == normalize_backup_name(f) else ""
+        lines.append(f"- `{f}`{synced}")
+    embed = discord.Embed(title="💾 Saved Backups", description="\n".join(lines), color=discord.Color.blurple())
+    embed.set_footer(text="🔄 = currently auto-syncing")
+    await ctx.send(embed=embed)
 
 
 # ============================================================
