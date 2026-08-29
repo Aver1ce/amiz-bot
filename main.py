@@ -107,14 +107,15 @@ AI_MODEL = "claude-sonnet-4-6"
 # ============================================================
 # DATA FILES (everything here persists across restarts)
 # ============================================================
-ROLES_FILE = "stored_roles.json"
-LEVELS_FILE = "levels.json"
-REACTION_ROLES_FILE = "reaction_roles.json"
-AFK_FILE = "afk.json"
-GUILD_SETTINGS_FILE = "guild_settings.json"
-BIRTHDAYS_FILE = "birthdays.json"
-GIVEAWAYS_FILE = "giveaways.json"
-STARBOARD_FILE = "starboard.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # anchor all data paths to the script's own folder, not whatever the current working directory happens to be when the process starts
+ROLES_FILE = os.path.join(BASE_DIR, "stored_roles.json")
+LEVELS_FILE = os.path.join(BASE_DIR, "levels.json")
+REACTION_ROLES_FILE = os.path.join(BASE_DIR, "reaction_roles.json")
+AFK_FILE = os.path.join(BASE_DIR, "afk.json")
+GUILD_SETTINGS_FILE = os.path.join(BASE_DIR, "guild_settings.json")
+BIRTHDAYS_FILE = os.path.join(BASE_DIR, "birthdays.json")
+GIVEAWAYS_FILE = os.path.join(BASE_DIR, "giveaways.json")
+STARBOARD_FILE = os.path.join(BASE_DIR, "starboard.json")
 
 
 def load_json(path):
@@ -1857,7 +1858,7 @@ async def ban(ctx, member: discord.Member, *, reason="No reason given"):
 # It restores STRUCTURE (roles, channels, categories, permissions) —
 # it does NOT restore messages, members, or who's in which role.
 # ============================================================
-BACKUPS_FOLDER = "backups"
+BACKUPS_FOLDER = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUPS_FOLDER, exist_ok=True)
 
 
@@ -2233,14 +2234,15 @@ DATA_FILES_FOR_EXPORT = [
 
 def build_data_export_zip() -> io.BytesIO:
     """Zips every JSON data file plus the whole backups/ folder (server structure backups)
-    into an in-memory file, ready to attach to a Discord message."""
+    into an in-memory file, ready to attach to a Discord message. Paths are stored relative
+    to BASE_DIR so the zip extracts back into the right place regardless of machine/host."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in DATA_FILES_FOR_EXPORT:
             if os.path.exists(path):
-                zf.write(path, arcname=path)
+                zf.write(path, arcname=os.path.relpath(path, BASE_DIR))
         for path in glob.glob(os.path.join(BACKUPS_FOLDER, "**", "*.json"), recursive=True):
-            zf.write(path, arcname=path)
+            zf.write(path, arcname=os.path.relpath(path, BASE_DIR))
     buffer.seek(0)
     return buffer
 
@@ -2326,7 +2328,7 @@ async def importdata(ctx, archive: discord.Attachment):
     raw = await archive.read()
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-            zf.extractall(".")
+            zf.extractall(BASE_DIR)
     except zipfile.BadZipFile:
         await ctx.send(embed=discord.Embed(description="⚠️ That zip file looks corrupted — try re-exporting or use an older backup DM.", color=discord.Color.red()))
         return
