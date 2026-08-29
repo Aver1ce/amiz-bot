@@ -402,9 +402,57 @@ async def on_guild_join(guild):
 
 
 @bot.event
+def describe_error(error: Exception):
+    """Maps an exception to (SHORT_CODE, plain-English message) so people see something
+    understandable instead of a raw Python error. Handles the common cases explicitly;
+    anything else falls back to a generic code with the raw message attached."""
+    error = getattr(error, "original", error)  # unwrap discord.py's CommandInvokeError wrapper
+
+    if isinstance(error, commands.NoPrivateMessage):
+        return "SERVER_ONLY", "This command only works inside a server, not in DMs."
+    if isinstance(error, commands.PrivateMessageOnly):
+        return "DM_ONLY", "This command only works in DMs with me, not inside a server."
+    if isinstance(error, commands.MissingPermissions):
+        perms = ", ".join(error.missing_permissions)
+        return "MISSING_PERMISSIONS", f"You need the **{perms}** permission to do that."
+    if isinstance(error, commands.BotMissingPermissions):
+        perms = ", ".join(error.missing_permissions)
+        return "BOT_MISSING_PERMISSIONS", f"I need the **{perms}** permission to do that — check my role's permissions and position."
+    if isinstance(error, commands.CheckFailure):
+        return "NOT_ALLOWED", "You aren't allowed to run this command."
+    if isinstance(error, commands.MissingRequiredArgument):
+        return "MISSING_ARGUMENT", f"You're missing the `{error.param.name}` argument — check the command's usage."
+    if isinstance(error, (commands.MemberNotFound, commands.UserNotFound)):
+        return "NOT_FOUND", "I couldn't find that member — check the name/mention and try again."
+    if isinstance(error, commands.ChannelNotFound):
+        return "NOT_FOUND", "I couldn't find that channel."
+    if isinstance(error, commands.RoleNotFound):
+        return "NOT_FOUND", "I couldn't find that role."
+    if isinstance(error, commands.BadArgument):
+        return "BAD_ARGUMENT", "One of the values you gave me isn't valid — check the command's usage."
+    if isinstance(error, commands.CommandOnCooldown):
+        return "COOLDOWN", f"That's on cooldown — try again in {error.retry_after:.0f}s."
+    if isinstance(error, discord.Forbidden):
+        return "NO_PERMISSION", "I don't have permission to do that — check my role's permissions and position in the server list."
+    if isinstance(error, discord.NotFound):
+        return "NOT_FOUND", "Whatever I was looking for (a message, channel, member, etc.) doesn't exist anymore."
+    if isinstance(error, discord.HTTPException):
+        return "DISCORD_ERROR", f"Discord rejected that request: {error}"
+    return "UNKNOWN_ERROR", f"Something went wrong: `{error}`"
+
+
+@bot.event
 async def on_command_error(ctx, error):
-    await dm_owner(f"⚠️ Error running `{ctx.command}` in {ctx.guild}: `{error}`")
-    await ctx.send(embed=discord.Embed(description=f"⚠️ Something went wrong: `{error}`", color=discord.Color.red()))
+    if isinstance(error, commands.CommandNotFound):
+        return  # a typo'd command name — nothing useful to say, stay quiet
+
+    code, message = describe_error(error)
+    await dm_owner(f"⚠️ [{code}] Error running `{ctx.command}` in {ctx.guild}: `{error}`")
+    embed = discord.Embed(title=f"⚠️ Error — {code}", description=message, color=discord.Color.red())
+    try:
+        await ctx.send(embed=embed)
+    except discord.Forbidden:
+        pass  # can't even send the error message here — nothing more to do
 
 
 # ============================================================
@@ -555,6 +603,7 @@ async def on_raw_reaction_remove(payload):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setstarboardchannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's starboard channel. Usage: !setstarboardchannel #starboard"""
@@ -563,6 +612,7 @@ async def setstarboardchannel(ctx, channel: discord.TextChannel):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setstarboardthreshold(ctx, count: int):
     """Sets how many ⭐ reactions a message needs to hit the starboard in THIS server.
@@ -629,6 +679,7 @@ async def createreactionrole(ctx, emoji: str, role: discord.Role, *, label: str 
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setavatar(ctx):
     """Sets a DIFFERENT bot avatar/pfp just for this server (Discord supports per-server bot avatars).
@@ -645,6 +696,7 @@ async def setavatar(ctx):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setnickname(ctx, *, nickname: str):
     """Sets the bot's nickname for THIS server only. Needs Manage Server permission.
@@ -658,6 +710,7 @@ async def setnickname(ctx, *, nickname: str):
 # welcome/goodbye/mod-log/timeout/level-up. Needs Manage Server permission to set.
 # ============================================================
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setwelcomechannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's welcome message channel. Usage: !setwelcomechannel #welcome"""
@@ -666,6 +719,7 @@ async def setwelcomechannel(ctx, channel: discord.TextChannel):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setgoodbyechannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's goodbye message channel. Usage: !setgoodbyechannel #goodbye"""
@@ -674,6 +728,7 @@ async def setgoodbyechannel(ctx, channel: discord.TextChannel):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setmodlogchannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's mod-log channel. Usage: !setmodlogchannel #mod-log"""
@@ -682,6 +737,7 @@ async def setmodlogchannel(ctx, channel: discord.TextChannel):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def settimeoutchannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's timeout channel (visible to timed-out members, they can't talk in it).
@@ -691,6 +747,7 @@ async def settimeoutchannel(ctx, channel: discord.TextChannel):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setlevelupchannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's level-up announcement channel. Usage: !setlevelupchannel #levels
@@ -704,6 +761,7 @@ async def setlevelupchannel(ctx, channel: discord.TextChannel):
 # its OWN extra words to block. Needs Manage Server permission.
 # ============================================================
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def addbannedword(ctx, *, word: str):
     """Adds a word to THIS server's custom banned-word list (on top of the built-in filter).
@@ -720,6 +778,7 @@ async def addbannedword(ctx, *, word: str):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def removebannedword(ctx, *, word: str):
     """Removes a word from THIS server's custom banned-word list. Usage: !removebannedword sometermsused"""
@@ -734,6 +793,7 @@ async def removebannedword(ctx, *, word: str):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def bannedwords(ctx):
     """Lists THIS server's custom banned words (not the built-in base filter)."""
@@ -749,6 +809,7 @@ async def bannedwords(ctx):
 # configured PER SERVER. Needs Manage Server permission.
 # ============================================================
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setxpamount(ctx, amount: int):
     """Sets how much XP a message earns in THIS server. Usage: !setxpamount 20 (default 15)"""
@@ -761,6 +822,7 @@ async def setxpamount(ctx, amount: int):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setvoicexpamount(ctx, amount: int):
     """Sets how much XP per minute members earn for being active in a voice channel in
@@ -774,6 +836,23 @@ async def setvoicexpamount(ctx, amount: int):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(state="Turn the XP/leveling system on or off for this server")
+async def togglelevels(ctx, state: typing.Literal["on", "off"]):
+    """Turns the whole XP/leveling system on or off for THIS server (chat XP, voice XP,
+    level-ups, and level-role rewards all stop when it's off). Usable by you (the bot owner)
+    or this server's own owner/Manage Server holders. Usage: !togglelevels off"""
+    guild_settings.setdefault(str(ctx.guild.id), {})["leveling_enabled"] = (state == "on")
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    if state == "on":
+        await ctx.send(embed=discord.Embed(description="✅ Leveling is now **on** for this server.", color=discord.Color.green()))
+    else:
+        await ctx.send(embed=discord.Embed(description="🛑 Leveling is now **off** for this server — no more XP, level-ups, or level-role rewards until it's turned back on.", color=discord.Color.orange()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setlevelrole(ctx, level: int, role: discord.Role):
     """Sets a role to be auto-given when someone reaches a level, IN THIS SERVER ONLY.
@@ -782,10 +861,11 @@ async def setlevelrole(ctx, level: int, role: discord.Role):
     level_roles = settings.setdefault("level_roles", {})
     level_roles[str(level)] = role.id
     save_json(GUILD_SETTINGS_FILE, guild_settings)
-    await ctx.send(embed=discord.Embed(description=f"✅ Reaching **Level {level}** now grants {role.mention} in this server.", color=discord.Color.green()))
+    await ctx.send(embed=discord.Embed(description=f"✅ Reaching **Level {level}** now grants {role.mention} in this server — just like Arcane's level-role rewards. Members keep every role they've earned as they level up further.", color=discord.Color.green()))
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def removelevelrole(ctx, level: int):
     """Removes a level-up role reward from THIS server. Usage: !removelevelrole 15"""
@@ -799,6 +879,7 @@ async def removelevelrole(ctx, level: int):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def listlevelroles(ctx):
     """Shows every level-up role reward configured for THIS server."""
     level_roles = guild_settings.get(str(ctx.guild.id), {}).get("level_roles", {})
@@ -813,6 +894,7 @@ async def listlevelroles(ctx):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def setlevel(ctx, member: discord.Member, level: int):
     """Directly sets a member's level in THIS server (resets their XP progress to 0 for that
@@ -828,6 +910,7 @@ async def setlevel(ctx, member: discord.Member, level: int):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def addxp(ctx, member: discord.Member, amount: int):
     """Gives a member a specific amount of XP in THIS server (handles level-ups + role
@@ -839,6 +922,7 @@ async def addxp(ctx, member: discord.Member, amount: int):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def showsettings(ctx):
     """Shows this server's currently configured channels and settings."""
     settings = guild_settings.get(str(ctx.guild.id), {})
@@ -1007,6 +1091,7 @@ async def check_for_raid(member: discord.Member):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(administrator=True)
 async def lockdown(ctx):
     """Manually locks all text channels (stops @everyone from sending messages)."""
@@ -1018,6 +1103,7 @@ async def lockdown(ctx):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(administrator=True)
 async def unlock(ctx):
     """Manually lifts a lockdown and turns off raid mode."""
@@ -1050,16 +1136,99 @@ def format_duration(seconds: float) -> str:
     return " ".join(parts)
 
 
+# ============================================================
+# AFK SYSTEM — one global AFK status per user (not per-server): going AFK in one server
+# shows you as AFK everywhere the bot can see you. Each server gets its own locked-down
+# "afk-list" channel (auto-created the first time it's needed) that always shows exactly
+# who's currently away, updated live whenever anyone's status changes anywhere.
+# ============================================================
+AFK_CHANNEL_NAME = "afk-list"
+
+
+async def get_or_create_afk_channel(guild: discord.Guild):
+    """Returns this server's AFK-list channel, auto-creating it (locked so regular members
+    can view but not post in it) the first time it's needed."""
+    settings = guild_settings.setdefault(str(guild.id), {})
+    channel = guild.get_channel(settings.get("afk_channel_id")) if settings.get("afk_channel_id") else None
+    if channel is not None:
+        return channel
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True),
+    }
+    try:
+        channel = await guild.create_text_channel(AFK_CHANNEL_NAME, overwrites=overwrites, reason="Auto-created AFK list channel")
+    except discord.Forbidden:
+        return None
+    settings["afk_channel_id"] = channel.id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    return channel
+
+
+async def refresh_afk_channel(guild: discord.Guild):
+    """Rebuilds/edits the standing 'who's AFK right now' message in this server's AFK-list
+    channel, based on the current GLOBAL afk_data."""
+    channel = await get_or_create_afk_channel(guild)
+    if channel is None:
+        return
+
+    lines = []
+    for user_id_str, data in afk_data.items():
+        member = guild.get_member(int(user_id_str))
+        if member is None:
+            continue
+        duration = format_duration(datetime.datetime.now(datetime.timezone.utc).timestamp() - data["since"])
+        lines.append(f"🌙 {member.mention} — *{data['activity']}* (away {duration})")
+
+    embed = discord.Embed(
+        title="🌙 Currently AFK",
+        description="\n".join(lines) if lines else "Nobody is AFK right now.",
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="Updates automatically whenever someone goes AFK or comes back — anywhere the bot can see them.")
+
+    settings = guild_settings.setdefault(str(guild.id), {})
+    message = None
+    if settings.get("afk_list_message_id"):
+        try:
+            message = await channel.fetch_message(settings["afk_list_message_id"])
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            message = None
+
+    try:
+        if message:
+            await message.edit(embed=embed)
+        else:
+            new_message = await channel.send(embed=embed)
+            settings["afk_list_message_id"] = new_message.id
+            save_json(GUILD_SETTINGS_FILE, guild_settings)
+    except discord.Forbidden:
+        pass
+
+
+async def sync_afk_status_for_member(user_id: int):
+    """Call this whenever one member's global AFK status changes. Refreshes the AFK-list
+    channel in every server the bot shares with them — so a status set in one server shows
+    up correctly in all the others too."""
+    for guild in bot.guilds:
+        if guild.get_member(user_id):
+            await refresh_afk_channel(guild)
+
+
 @bot.hybrid_command()
 async def afk(ctx, *, activity: str = "AFK"):
-    """Marks you as AFK. Usage: !afk sleeping
-    Anyone who pings or replies to you will be told you're away, what you're doing,
-    and how long you've been gone. Clears automatically the next time you send a message."""
+    """Marks you as AFK — GLOBALLY, across every server the bot shares with you, not just
+    this one. Usage: !afk sleeping
+    Anyone who pings or replies to you (in any of those servers) will be told you're away,
+    what you're doing, and how long you've been gone. Also shows up in each server's AFK-list
+    channel. Clears automatically the next time you send a message anywhere."""
     afk_data[str(ctx.author.id)] = {"activity": activity, "since": datetime.datetime.now(datetime.timezone.utc).timestamp()}
     save_json(AFK_FILE, afk_data)
     embed = discord.Embed(description=f"**{activity}**", color=discord.Color.greyple())
     embed.set_author(name=f"{ctx.author.display_name} is now AFK", icon_url=ctx.author.display_avatar.url)
     await ctx.send(embed=embed)
+    await sync_afk_status_for_member(ctx.author.id)
 
 
 async def handle_afk(message: discord.Message):
@@ -1075,6 +1244,7 @@ async def handle_afk(message: discord.Message):
         welcome_embed = discord.Embed(description=f"Welcome back — you were away for **{duration}**.", color=discord.Color.green())
         welcome_embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
         await message.channel.send(embed=welcome_embed, delete_after=8)
+        await sync_afk_status_for_member(message.author.id)
 
     # Figure out who's being pinged or replied to in this message
     targets = list(message.mentions)
@@ -1165,6 +1335,8 @@ async def grant_xp(member, guild, amount, announce_channel=None):
 
 async def add_xp(message):
     guild_id = str(message.guild.id)
+    if not guild_settings.get(guild_id, {}).get("leveling_enabled", True):
+        return
     user_id = str(message.author.id)
     cooldown_key = f"{guild_id}:{user_id}"
     now = datetime.datetime.now(datetime.timezone.utc).timestamp()
@@ -1188,6 +1360,8 @@ VOICE_XP_CHECK_INTERVAL_MINUTES = 5
 
 
 async def award_voice_xp(guild, member, minutes_elapsed):
+    if not guild_settings.get(str(guild.id), {}).get("leveling_enabled", True):
+        return
     rate = guild_settings.get(str(guild.id), {}).get("voice_xp_per_minute", DEFAULT_VOICE_XP_PER_MINUTE)
     if rate <= 0 or minutes_elapsed <= 0:
         return
@@ -1290,6 +1464,7 @@ async def birthday(ctx, member: discord.Member = None):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 @discord.app_commands.describe(channel="Channel where birthday announcements should post")
 async def setbirthdaychannel(ctx, channel: discord.TextChannel):
@@ -1321,6 +1496,7 @@ async def birthday_check():
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def rank(ctx, member: discord.Member = None):
     """Shows your (or someone's) level in THIS server."""
     member = member or ctx.author
@@ -1362,6 +1538,7 @@ class LeaderboardView(discord.ui.View):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def leaderboard(ctx):
     """Shows the top 10 in THIS server only, styled as a compact ranked list with a category dropdown."""
     guild_levels = levels_data.get(str(ctx.guild.id), {})
@@ -1434,6 +1611,7 @@ def parse_duration(text: str):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def giveaway(ctx, duration: str, winners: int, *, prize: str):
     """Starts a giveaway. Usage: !giveaway 1h 1 Nitro Classic
@@ -1767,6 +1945,7 @@ async def restore_roles(member: discord.Member, guild: discord.Guild):
 # MOD COMMANDS
 # ============================================================
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(moderate_members=True)
 async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reason given"):
     await custom_timeout(member, ctx.guild, minutes, reason, moderator=ctx.author)
@@ -1774,6 +1953,7 @@ async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reaso
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(moderate_members=True)
 async def untimeout(ctx, member: discord.Member):
     await restore_roles(member, ctx.guild)
@@ -1781,6 +1961,7 @@ async def untimeout(ctx, member: discord.Member):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_messages=True)
 async def clear(ctx, amount: int):
     """Deletes the last <amount> messages in this channel. Usage: !clear 20"""
@@ -1794,6 +1975,7 @@ async def clear(ctx, amount: int):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_messages=True)
 async def clearuser(ctx, member: discord.Member, amount: int = 100):
     """Deletes messages from a specific user (scans the last <amount> messages, default 100).
@@ -1812,6 +1994,7 @@ async def clearuser(ctx, member: discord.Member, amount: int = 100):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(manage_messages=True)
 async def clearkeyword(ctx, keyword: str, amount: int = 100):
     """Deletes messages containing a specific word/phrase (scans the last <amount> messages, default 100).
@@ -1832,26 +2015,30 @@ async def clearkeyword(ctx, keyword: str, amount: int = 100):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(kick_members=True)
 async def kick(ctx, member: discord.Member, *, reason="No reason given"):
+    dm_note = ""
     try:
         await member.send(embed=discord.Embed(description=f"👢 You were kicked from **{ctx.guild.name}**.\nReason: {reason}", color=discord.Color.red()))
     except discord.Forbidden:
-        pass  # they have DMs off, can't be helped
+        dm_note = "\n⚠️ DM_CLOSED: Couldn't notify them by DM — their DMs are closed."
     await member.kick(reason=reason)
-    await ctx.send(embed=discord.Embed(description=f"👢 Kicked {member.mention}.\nReason: {reason}", color=discord.Color.red()))
+    await ctx.send(embed=discord.Embed(description=f"👢 Kicked {member.mention}.\nReason: {reason}{dm_note}", color=discord.Color.red()))
     await mod_log(ctx.guild, "Member Kicked", member, ctx.author, reason, discord.Color.red())
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @has_permissions_or_owner(ban_members=True)
 async def ban(ctx, member: discord.Member, *, reason="No reason given"):
+    dm_note = ""
     try:
         await member.send(embed=discord.Embed(description=f"🔨 You were banned from **{ctx.guild.name}**.\nReason: {reason}", color=discord.Color.dark_red()))
     except discord.Forbidden:
-        pass  # they have DMs off, can't be helped
+        dm_note = "\n⚠️ DM_CLOSED: Couldn't notify them by DM — their DMs are closed."
     await member.ban(reason=reason)
-    await ctx.send(embed=discord.Embed(description=f"🔨 Banned {member.mention}.\nReason: {reason}", color=discord.Color.dark_red()))
+    await ctx.send(embed=discord.Embed(description=f"🔨 Banned {member.mention}.\nReason: {reason}{dm_note}", color=discord.Color.dark_red()))
     # Note: on_member_ban also fires and logs this via the audit log — that's fine as a backup,
     # duplicate log entries just mean extra confirmation.
 
@@ -2003,6 +2190,7 @@ def schedule_auto_backup(guild):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @backup_permission()
 async def backupserver(ctx, backup_name: str):
     """Saves this server's roles, channels (with permission overwrites), and who has which
@@ -2029,6 +2217,7 @@ async def backupserver(ctx, backup_name: str):
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @owner_only()
 @discord.app_commands.describe(
     mode="Turn auto-sync on for an existing backup, off, or just check status",
@@ -2079,6 +2268,7 @@ async def autobackup(ctx, mode: typing.Literal["status", "on", "off"] = "status"
 
 
 @bot.hybrid_command()
+@commands.guild_only()
 @backup_permission()
 @discord.app_commands.describe(
     backup_name="Which saved backup to restore (leave blank to list your saves)",
@@ -2348,6 +2538,100 @@ async def broadcast(ctx, *, message: str):
     await ctx.send(embed=summary)
 
 
+# ============================================================
+# "ANNI" — bot-creator-only, permanent deletion commands. Named after "annihilate": these
+# don't archive or soft-delete anything, they call Discord's real delete endpoints. There is
+# no undo beyond restoring a backup made BEFORE running one of these (!backupserver /
+# !restoreserver). !anniserver asks for typed confirmation first since it wipes everything.
+# ============================================================
+@bot.hybrid_command()
+@commands.guild_only()
+@owner_only()
+@discord.app_commands.describe(channel="The channel to permanently delete")
+async def annichannel(ctx, channel: discord.abc.GuildChannel):
+    """Bot-creator only. Permanently deletes a single channel — gone, not archived.
+    Usage: !annichannel #some-channel"""
+    name = channel.name
+    try:
+        await channel.delete(reason=f"Annihilated by bot owner ({ctx.author})")
+    except discord.Forbidden:
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — NO_PERMISSION", description="I don't have permission to delete that channel.", color=discord.Color.red()))
+        return
+    await ctx.send(embed=discord.Embed(description=f"💥 Deleted channel `#{name}`.", color=discord.Color.dark_red()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@owner_only()
+@discord.app_commands.describe(category="The category to permanently delete, along with every channel inside it")
+async def annicategory(ctx, category: discord.CategoryChannel):
+    """Bot-creator only. Permanently deletes a category AND every channel inside it — gone,
+    not archived. Usage: !annicategory CategoryName"""
+    channels = list(category.channels)
+    deleted = 0
+    for ch in channels:
+        try:
+            await ch.delete(reason=f"Annihilated by bot owner ({ctx.author}) — category wipe")
+            deleted += 1
+        except discord.HTTPException:
+            pass
+    try:
+        await category.delete(reason=f"Annihilated by bot owner ({ctx.author})")
+    except discord.Forbidden:
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — NO_PERMISSION", description=f"Deleted {deleted}/{len(channels)} channel(s) inside, but couldn't delete the category itself.", color=discord.Color.red()))
+        return
+    await ctx.send(embed=discord.Embed(description=f"💥 Deleted category `{category.name}` and {deleted} channel(s) inside it.", color=discord.Color.dark_red()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@owner_only()
+async def anniserver(ctx):
+    """Bot-creator only. PERMANENTLY deletes EVERY channel, category, and custom role in
+    THIS server — gone, not archived. Asks you to type `confirm` first since it cannot be
+    undone (short of restoring a backup made beforehand). Usage: !anniserver"""
+    guild = ctx.guild
+    await ctx.send(embed=discord.Embed(
+        title="⚠️ Are you absolutely sure?",
+        description=f"This will permanently delete **every channel, category, and custom role** in **{guild.name}**. This cannot be undone.\n\nType `confirm` within 30 seconds to proceed, or anything else (or nothing) to cancel.",
+        color=discord.Color.red(),
+    ))
+
+    def check(m):
+        return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
+
+    try:
+        reply = await bot.wait_for("message", check=check, timeout=30)
+    except asyncio.TimeoutError:
+        await ctx.send(embed=discord.Embed(description="⏱️ Timed out — nothing was deleted.", color=discord.Color.greyple()))
+        return
+    if reply.content.strip().lower() != "confirm":
+        await ctx.send(embed=discord.Embed(description="Cancelled — nothing was deleted.", color=discord.Color.greyple()))
+        return
+
+    deleted_channels = 0
+    for channel in list(guild.channels):
+        try:
+            await channel.delete(reason=f"Server annihilated by bot owner ({ctx.author})")
+            deleted_channels += 1
+        except discord.HTTPException:
+            pass
+
+    deleted_roles = 0
+    for role in list(guild.roles):
+        if role.is_default() or role.managed:
+            continue
+        try:
+            await role.delete(reason=f"Server annihilated by bot owner ({ctx.author})")
+            deleted_roles += 1
+        except discord.HTTPException:
+            pass
+
+    # The channel this command ran in was very likely just deleted above, so report the
+    # result over DM instead of trying (and probably failing) to send it back there.
+    await dm_owner(f"💥 Annihilated **{guild.name}** — deleted {deleted_channels} channel(s) and {deleted_roles} role(s).", color=discord.Color.dark_red())
+
+
 @bot.hybrid_command()
 @owner_only()
 async def exportdata(ctx):
@@ -2362,7 +2646,7 @@ async def exportdata(ctx):
         if ctx.guild is not None:
             await ctx.send(embed=discord.Embed(description="📦 Sent you a DM with the full backup zip.", color=discord.Color.green()))
     except discord.Forbidden:
-        await ctx.send(embed=discord.Embed(description="⚠️ Couldn't DM you the export — check that your DMs are open, or run this command in a DM with me instead.", color=discord.Color.red()))
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — DM_CLOSED", description="Couldn't DM you the export — your DMs are closed. Open your DMs to me, or run this command in a DM with me instead.", color=discord.Color.red()))
 
 
 @bot.hybrid_command()
