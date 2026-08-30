@@ -2929,8 +2929,11 @@ async def joinvc(ctx, channel: discord.VoiceChannel = None):
             await existing.move_to(channel)
         else:
             await channel.connect(reconnect=True)
-    except discord.ClientException as e:
-        await ctx.send(embed=discord.Embed(title="⚠️ Error — VOICE_ERROR", description=f"Couldn't join — {e} (likely missing PyNaCl — add it to requirements.txt).", color=discord.Color.red()))
+    except (discord.ClientException, RuntimeError) as e:
+        if "PyNaCl" in str(e):
+            await ctx.send(embed=discord.Embed(title="⚠️ Error — MISSING_DEPENDENCY", description="This host doesn't have **PyNaCl** installed, which is required for voice. Add `PyNaCl` to requirements.txt and redeploy — voice can't work without it.", color=discord.Color.red()))
+        else:
+            await ctx.send(embed=discord.Embed(title="⚠️ Error — VOICE_ERROR", description=f"Couldn't join — {e}", color=discord.Color.red()))
         return
     except asyncio.TimeoutError:
         await ctx.send(embed=discord.Embed(title="⚠️ Error — VOICE_TIMEOUT", description="Timed out trying to connect to that voice channel.", color=discord.Color.red()))
