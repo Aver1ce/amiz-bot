@@ -430,7 +430,7 @@ def build_setup_guide_embed(guild: discord.Guild) -> discord.Embed:
         value=(
             "`setwelcomechannel` `setgoodbyechannel` `setmodlogchannel` `settimeoutchannel`\n"
             "`setlevelupchannel` `setbirthdaychannel` `setstarboardchannel` `setstarboardthreshold`\n"
-            "`setxpamount` `setvoicexpamount` `setlevelrole` `addbannedword` `showsettings`"
+            "`setannouncementchannel` `setxpamount` `setvoicexpamount` `setlevelrole` `addbannedword` `showsettings`"
         ),
         inline=False,
     )
@@ -475,6 +475,17 @@ async def find_greetable_channel(guild: discord.Guild):
     return next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
 
 
+async def get_announcement_channel(guild: discord.Guild):
+    """Where bot-wide announcements (broadcasts, the join setup-guide) post in this server.
+    Uses the channel set with !setannouncementchannel if there is one and the bot can still
+    post there; otherwise falls back to find_greetable_channel's default (system channel,
+    or the first channel the bot can talk in)."""
+    configured = get_guild_channel(guild.id, "announcement_channel")
+    if configured and configured.permissions_for(guild.me).send_messages:
+        return configured
+    return await find_greetable_channel(guild)
+
+
 @bot.event
 async def on_guild_join(guild):
     """Fires the instant someone adds the bot to a new server."""
@@ -484,7 +495,7 @@ async def on_guild_join(guild):
 
     await dm_owner(f"➕ Added to a new server: **{guild.name}** (`{guild.id}`).")
     await cache_guild_invites(guild)
-    channel = await find_greetable_channel(guild)
+    channel = await get_announcement_channel(guild)
     if channel:
         try:
             await channel.send(embed=build_setup_guide_embed(guild))
@@ -840,6 +851,19 @@ async def setwelcomechannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's welcome message channel. Usage: !setwelcomechannel #welcome"""
     set_guild_channel(ctx.guild.id, "welcome_channel", channel.id)
     await ctx.send(embed=discord.Embed(description=f"✅ Welcome messages will now post in {channel.mention}.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+async def setannouncementchannel(ctx, channel: discord.TextChannel):
+    """Sets THIS server's channel for bot-wide announcements — right now that's the
+    bot-creator's !broadcast messages, and the one-time setup guide posted when the bot
+    joins. Without this set, those default to the system channel (often #general or
+    whatever ends up being #rules-adjacent), which usually isn't ideal.
+    Usage: !setannouncementchannel #announcements"""
+    set_guild_channel(ctx.guild.id, "announcement_channel", channel.id)
+    await ctx.send(embed=discord.Embed(description=f"📢 Bot announcements (including broadcasts) will now post in {channel.mention}.", color=discord.Color.green()))
 
 
 @bot.hybrid_command()
@@ -2860,7 +2884,7 @@ async def broadcast(ctx, *, message: str):
 
     sent, failed = 0, []
     for guild in bot.guilds:
-        channel = await find_greetable_channel(guild)
+        channel = await get_announcement_channel(guild)
         if channel is None:
             failed.append(guild.name)
             continue
@@ -2878,6 +2902,54 @@ async def broadcast(ctx, *, message: str):
     if failed:
         summary.add_field(name="⚠️ Couldn't reach", value=", ".join(failed)[:1024], inline=False)
     await ctx.send(embed=summary)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@owner_only()
+@discord.app_commands.describe(channel="Voice channel to join (leave blank to join whichever VC you're currently in)")
+async def joinvc(ctx, channel: discord.VoiceChannel = None):
+    """Bot-creator only. Joins a voice channel in THIS server and stays connected — e.g. to
+    keep a VC-activity streak/tracker going. Usage: !joinvc #general-voice, or just !joinvc
+    while you're sitting in a voice channel yourself. Needs PyNaCl installed (add it to
+    requirements.txt) — voice doesn't work without it.
+    Heads up: this only helps if whatever tracks your 'streak' counts ANY member's presence
+    in the channel — trackers that specifically check for YOUR account won't be fooled by
+    the bot sitting in there instead of you."""
+    if channel is None:
+        author_voice_state = ctx.author.voice
+        if author_voice_state is None or author_voice_state.channel is None:
+            await ctx.send(embed=discord.Embed(description="Join a voice channel first, or tell me which one: `!joinvc #channel`.", color=discord.Color.red()))
+            return
+        channel = author_voice_state.channel
+
+    existing = ctx.guild.voice_client
+    try:
+        if existing and existing.is_connected():
+            await existing.move_to(channel)
+        else:
+            await channel.connect(reconnect=True)
+    except discord.ClientException as e:
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — VOICE_ERROR", description=f"Couldn't join — {e} (likely missing PyNaCl — add it to requirements.txt).", color=discord.Color.red()))
+        return
+    except asyncio.TimeoutError:
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — VOICE_TIMEOUT", description="Timed out trying to connect to that voice channel.", color=discord.Color.red()))
+        return
+    await ctx.send(embed=discord.Embed(description=f"🔊 Joined {channel.mention} and staying connected.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@owner_only()
+async def leavevc(ctx):
+    """Bot-creator only. Disconnects the bot from voice in THIS server. Usage: !leavevc"""
+    voice_client = ctx.guild.voice_client
+    if voice_client is None or not voice_client.is_connected():
+        await ctx.send(embed=discord.Embed(description="I'm not in a voice channel here.", color=discord.Color.greyple()))
+        return
+    channel_name = voice_client.channel.name
+    await voice_client.disconnect(force=True)
+    await ctx.send(embed=discord.Embed(description=f"👋 Left `#{channel_name}`.", color=discord.Color.orange()))
 
 
 # ============================================================
