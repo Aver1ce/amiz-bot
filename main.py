@@ -28,6 +28,7 @@ intents.members = True
 intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+bot.help_command = None  # replaced by our own button-based !help command further down
 
 # ============================================================
 # CONFIG — edit these values for your server
@@ -154,6 +155,7 @@ BIRTHDAYS_FILE = os.path.join(BASE_DIR, "birthdays.json")
 GIVEAWAYS_FILE = os.path.join(BASE_DIR, "giveaways.json")
 STARBOARD_FILE = os.path.join(BASE_DIR, "starboard.json")
 INVITES_FILE = os.path.join(BASE_DIR, "invites.json")
+GLOBAL_BANS_FILE = os.path.join(BASE_DIR, "global_bans.json")
 
 
 def load_json(path):
@@ -193,6 +195,9 @@ starboard_data = load_json(STARBOARD_FILE)
 # {"guild_id": {"invite_counts": {"inviter_user_id": total_successful_invites},
 #                "joins": {"member_user_id": {"inviter_id", "invite_code", "since"}}}}
 invite_data = load_json(INVITES_FILE)
+# global_bans.json format: {"user_id": {"reason", "banned_by", "timestamp"}} — anyone here
+# gets banned from every server the bot is in, and auto-banned in any server it joins later
+global_bans_data = load_json(GLOBAL_BANS_FILE)
 guild_invite_cache = {}  # runtime only: guild_id -> {invite_code: uses} snapshot, used to spot
                           # which invite's use-count went up when someone joins
 
@@ -411,60 +416,128 @@ async def on_ready():
     await dm_owner(f"✅ **{bot.user.name}** just came online.")
 
 
-def build_setup_guide_embed(guild: discord.Guild) -> discord.Embed:
-    """The embed posted in a server right after the bot joins, explaining how to set things up."""
-    embed = discord.Embed(
-        title=f"👋 Thanks for adding {bot.user.name}!",
-        description=(
-            f"Before anything else: **make sure I stay in this server, and that I have "
-            f"Administrator permission** — most of my features (backups, moderation, channel "
-            f"setup) need it to work properly. My owner can run any of my commands here "
-            f"regardless of their own permissions, but I'll only operate in this server at all "
-            f"while they're a member of it — that's a built-in safety lock, not a bug.\n\n"
-            f"Prefix commands use `!`, or use the same commands as `/slash` commands anywhere."
-        ),
-        color=discord.Color.blurple(),
-    )
-    embed.add_field(
-        name="⚙️ Setup (needs Manage Server)",
-        value=(
+HELP_CATEGORIES = {
+    "setup": {
+        "label": "⚙️ Setup",
+        "title": "⚙️ Setup Commands",
+        "description": "Needs Manage Server permission, or the bot owner.",
+        "commands": (
             "`setwelcomechannel` `setgoodbyechannel` `setmodlogchannel` `settimeoutchannel`\n"
             "`setlevelupchannel` `setbirthdaychannel` `setstarboardchannel` `setstarboardthreshold`\n"
-            "`setannouncementchannel` `setxpamount` `setvoicexpamount` `setlevelrole` `addbannedword` `showsettings`"
+            "`setannouncementchannel` `setxpamount` `setvoicexpamount` `togglelevels`\n"
+            "`setlevelrole` `removelevelrole` `listlevelroles` `addbannedword` `removebannedword`\n"
+            "`bannedwords` `showsettings`"
         ),
-        inline=False,
-    )
-    embed.add_field(
-        name="🛡️ Moderation",
-        value=(
+    },
+    "moderation": {
+        "label": "🛡️ Moderation",
+        "title": "🛡️ Moderation Commands",
+        "description": "Needs the matching Discord permission (kick/ban/manage channels), or the bot owner.",
+        "commands": (
             "`kick` `ban` `timeout` `untimeout` `clear` `clearuser` `clearkeyword`\n"
-            "`lockdown` `unlock` `bannedwords` `removebannedword`"
+            "`lockdown` `unlock` `lockchannel` `unlockchannel`"
         ),
-        inline=False,
-    )
-    embed.add_field(
-        name="📈 Leveling, Reaction Roles & Fun",
-        value=(
-            "`rank` `leaderboard` `globalleaderboard` `setlevel` `addxp` `afk`\n"
-            "`giveaway` `gend` `greroll` `reactionrole` `createreactionrole` `removereactionrole`"
+    },
+    "leveling": {
+        "label": "📈 Leveling & Roles",
+        "title": "📈 Leveling, Reaction & Role Menus",
+        "description": "XP progress, level-up role rewards, and self-role menus.",
+        "commands": (
+            "`rank` `leaderboard` `globalleaderboard` `setlevel` `addxp`\n"
+            "`rolemenu` — button-based self-roles (recommended!)\n"
+            "`reactionrole` `createreactionrole` `removereactionrole` — older, reaction-based"
         ),
-        inline=False,
-    )
-    embed.add_field(
-        name="🎂 Birthdays & ⭐ Starboard",
-        value="`setbirthday` `birthday` `setbirthdaychannel` `setstarboardchannel` `setstarboardthreshold`",
-        inline=False,
-    )
-    embed.add_field(
-        name="💾 Server Backups",
-        value=(
+    },
+    "fun": {
+        "label": "🎉 Fun & Extras",
+        "title": "🎉 Fun & Extras",
+        "description": "Just for fun.",
+        "commands": (
+            "`8ball` `coinflip` `roll` `rps` `joke`\n"
+            "`afk` `birthday` `setbirthday` `giveaway` `gend` `greroll`"
+        ),
+    },
+    "backups": {
+        "label": "💾 Backups",
+        "title": "💾 Server Backups",
+        "description": "Save and restore a server's roles/channels.",
+        "commands": (
             "`backupserver <name>` — saves roles/channels and keeps auto-syncing them\n"
-            "`restoreserver <name> [all|roles|channels]` `listbackups` `autobackup`"
+            "`restoreserver <name> [all|roles|channels]` `listbackups`\n"
+            "`autobackup` (bot owner only)"
         ),
-        inline=False,
-    )
-    embed.set_footer(text="Type !showsettings any time to see this server's current configuration.")
-    return embed
+    },
+    "owner": {
+        "label": "👑 Owner-Only",
+        "title": "👑 Bot-Creator-Only Commands",
+        "description": "Only the bot's creator can run these — powerful, cross-server, or destructive.",
+        "commands": (
+            "`broadcast` — message every server at once\n"
+            "`globalban` `globalunban` `globalbanlist` — bans across every server\n"
+            "`annirole` `annichannel` `annicategory` `anniserver` — permanent deletion\n"
+            "`exportdata` `importdata` — off-host data backup/restore\n"
+            "`joinvc` `leavevc` — voice channel presence\n"
+            "`invites` `inviteleaderboard` — invite tracking"
+        ),
+    },
+}
+
+
+def build_help_embed(category: str) -> discord.Embed:
+    """Builds the embed for one !help panel — 'home' is the landing page, anything else is
+    a HELP_CATEGORIES key."""
+    if category == "home":
+        embed = discord.Embed(
+            title=f"📖 {bot.user.name} — Command Help",
+            description=(
+                "Click a category below to see its commands. Prefix commands use `!`, or use "
+                "any of these as `/slash` commands too.\n\n"
+                "**Before anything else:** make sure the bot owner stays a member of this "
+                "server with Administrator — most features (backups, moderation, channel "
+                "setup) need it to work properly."
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text="Type !showsettings any time to see this server's current configuration.")
+        return embed
+
+    info = HELP_CATEGORIES[category]
+    return discord.Embed(title=info["title"], description=f"{info['description']}\n\n{info['commands']}", color=discord.Color.blurple())
+
+
+class HelpView(discord.ui.View):
+    """Category buttons for !help — clicking one edits the embed in place instead of dumping
+    every command as one wall of text."""
+    def __init__(self, is_owner: bool, timeout: float = 180):
+        super().__init__(timeout=timeout)
+        row0_categories = ["setup", "moderation", "leveling", "fun", "backups"]
+        for key in row0_categories:
+            info = HELP_CATEGORIES[key]
+            button = discord.ui.Button(label=info["label"], style=discord.ButtonStyle.primary, row=0)
+            button.callback = self._make_callback(key)
+            self.add_item(button)
+
+        if is_owner:
+            owner_info = HELP_CATEGORIES["owner"]
+            owner_button = discord.ui.Button(label=owner_info["label"], style=discord.ButtonStyle.danger, row=1)
+            owner_button.callback = self._make_callback("owner")
+            self.add_item(owner_button)
+
+        home_button = discord.ui.Button(label="🏠 Home", style=discord.ButtonStyle.secondary, row=1)
+        home_button.callback = self._make_callback("home")
+        self.add_item(home_button)
+
+    def _make_callback(self, category: str):
+        async def callback(interaction: discord.Interaction):
+            await interaction.response.edit_message(embed=build_help_embed(category))
+        return callback
+
+
+@bot.hybrid_command(name="help")
+async def help_command(ctx):
+    """Shows an interactive button menu of every command, grouped by category. Usage: !help"""
+    is_owner = ctx.author.id == OWNER_ID
+    await ctx.send(embed=build_help_embed("home"), view=HelpView(is_owner=is_owner))
 
 
 async def find_greetable_channel(guild: discord.Guild):
@@ -495,10 +568,32 @@ async def on_guild_join(guild):
 
     await dm_owner(f"➕ Added to a new server: **{guild.name}** (`{guild.id}`).")
     await cache_guild_invites(guild)
+
+    if global_bans_data:
+        banned_here = 0
+        for user_id_str in list(global_bans_data.keys()):
+            member = guild.get_member(int(user_id_str))
+            if member is None:
+                continue
+            try:
+                await member.ban(reason=f"GLOBAL BAN (auto-enforced on join): {global_bans_data[user_id_str].get('reason', 'No reason given')}")
+                banned_here += 1
+            except discord.Forbidden:
+                pass
+        if banned_here:
+            await dm_owner(f"🌐 Auto-banned {banned_here} globally-banned member(s) already present in **{guild.name}**.")
+
     channel = await get_announcement_channel(guild)
     if channel:
         try:
-            await channel.send(embed=build_setup_guide_embed(guild))
+            await channel.send(
+                embed=discord.Embed(
+                    title=f"👋 Thanks for adding {bot.user.name}!",
+                    description="Run `/help` any time for an interactive menu of every command, grouped by category.",
+                    color=discord.Color.blurple(),
+                ),
+                view=HelpView(is_owner=False),
+            )
         except discord.Forbidden:
             pass
 
@@ -563,6 +658,15 @@ async def on_command_error(ctx, error):
 async def on_member_join(member):
     if REQUIRE_OWNER_PRESENT and not await owner_in_guild(member.guild):
         return  # bricked — owner isn't in this server
+
+    if str(member.id) in global_bans_data:
+        reason = global_bans_data[str(member.id)].get("reason", "No reason given")
+        try:
+            await member.ban(reason=f"GLOBAL BAN (auto-enforced): {reason}")
+            await dm_owner(f"🌐 Auto-banned **{member}** in **{member.guild.name}** — they're on the global ban list ({reason}).")
+        except discord.Forbidden:
+            await dm_owner(f"⚠️ {member} is globally banned but I couldn't auto-ban them in **{member.guild.name}** — missing permission.")
+        return  # don't welcome/track invites for someone who was just banned
 
     channel = get_guild_channel(member.guild.id, "welcome_channel")
     if channel:
@@ -865,17 +969,26 @@ async def createreactionrole(ctx, emoji: str, role: discord.Role, *, label: str 
     role1="First role", role2="Second role (optional)", role3="Third role (optional)",
     role4="Fourth role (optional)", role5="Fifth role (optional)",
     description="Optional text under the title (defaults to a simple instruction)",
+    image="Optional image URL — shown as a big banner at the bottom of the menu",
+    thumbnail="Optional image URL — shown as a small thumbnail in the top-right corner",
+    color="Optional hex color for the embed's side bar, e.g. #5865F2",
 )
 async def rolemenu(ctx, title: str, role1: discord.Role, role2: discord.Role = None,
                     role3: discord.Role = None, role4: discord.Role = None, role5: discord.Role = None,
-                    description: str = None):
+                    description: str = None, image: str = None, thumbnail: str = None, color: str = None):
     """Posts a button-based self-role menu — click a button to get that role, click it again
     to remove it. No reactions involved, and it keeps working after a bot restart (each
-    button carries its own role, so nothing needs to be re-registered on startup).
+    button carries its own role, so nothing needs to be re-registered on startup). Add an
+    image/thumbnail/color to make it match your server's vibe.
     Usage: !rolemenu "Pick your pings" @VC @Announcements @Events @Giveaways
     Usable by anyone with Manage Roles (Administrators included) or the bot owner."""
     roles = [r for r in (role1, role2, role3, role4, role5) if r is not None]
-    embed = discord.Embed(title=title, description=description or "Click a button below to toggle a role.", color=discord.Color.blurple())
+    embed_color = parse_hex_color(color) or discord.Color.blurple()
+    embed = discord.Embed(title=title, description=description or "Click a button below to toggle a role.", color=embed_color)
+    if image:
+        embed.set_image(url=image)
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
     view = discord.ui.View(timeout=None)
     for role in roles:
         view.add_item(discord.ui.Button(label=role.name[:80], style=discord.ButtonStyle.secondary, custom_id=f"rolemenu:{role.id}"))
@@ -1330,10 +1443,15 @@ async def check_for_raid(member: discord.Member):
             reason = f"Anti-raid: account is only {account_age_days} day(s) old, joined during active raid"
             try:
                 if RAID_ACTION == "ban":
-                    await member.ban(reason=reason)
+                    # Anti-raid bans are GLOBAL — a raid account gets banned everywhere the
+                    # bot has a presence, not just the server that got raided.
+                    global_bans_data[str(member.id)] = {"reason": reason, "banned_by": bot.user.id, "timestamp": datetime.datetime.now(datetime.timezone.utc).timestamp()}
+                    save_json(GLOBAL_BANS_FILE, global_bans_data)
+                    success, failed = await apply_global_ban(member.id, f"GLOBAL BAN (anti-raid auto-ban): {reason}")
+                    await mod_log(member.guild, "Anti-Raid Auto-Ban (GLOBAL)", member, bot.user, f"{reason} — banned in {success}/{len(bot.guilds)} server(s)", discord.Color.dark_red())
                 else:
                     await member.kick(reason=reason)
-                await mod_log(member.guild, f"Anti-Raid Auto-{RAID_ACTION.title()}", member, bot.user, reason, discord.Color.dark_red())
+                    await mod_log(member.guild, "Anti-Raid Auto-Kick", member, bot.user, reason, discord.Color.dark_red())
             except discord.Forbidden:
                 await dm_owner(f"⚠️ Tried to auto-{RAID_ACTION} {member} during a raid but didn't have permission.")
 
@@ -1399,6 +1517,120 @@ async def unlockchannel(ctx, channel: discord.TextChannel = None):
         return
     await ctx.send(embed=discord.Embed(description=f"🔓 {channel.mention} is unlocked again.", color=discord.Color.green()))
     await mod_log(ctx.guild, "Channel Unlocked", channel, ctx.author, "Manually unlocked", discord.Color.green())
+
+
+# ============================================================
+# FUN & EXTRAS
+# ============================================================
+class RPSView(discord.ui.View):
+    """Rock-paper-scissors — pick a button, bot picks at the same time."""
+    def __init__(self, author_id: int, timeout: float = 30):
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Start your own game with `!rps`!", ephemeral=True)
+            return False
+        return True
+
+    async def resolve(self, interaction: discord.Interaction, user_choice: str):
+        bot_choice = random.choice(["🪨 Rock", "📄 Paper", "✂️ Scissors"])
+        beats = {"🪨 Rock": "✂️ Scissors", "📄 Paper": "🪨 Rock", "✂️ Scissors": "📄 Paper"}
+        if user_choice == bot_choice:
+            outcome = "It's a tie!"
+        elif beats[user_choice] == bot_choice:
+            outcome = "You win! 🎉"
+        else:
+            outcome = "I win! 😎"
+        for child in self.children:
+            child.disabled = True
+        embed = discord.Embed(description=f"You picked **{user_choice}**\nI picked **{bot_choice}**\n\n**{outcome}**", color=discord.Color.blurple())
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+    @discord.ui.button(label="Rock", emoji="🪨", style=discord.ButtonStyle.secondary)
+    async def rock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.resolve(interaction, "🪨 Rock")
+
+    @discord.ui.button(label="Paper", emoji="📄", style=discord.ButtonStyle.secondary)
+    async def paper(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.resolve(interaction, "📄 Paper")
+
+    @discord.ui.button(label="Scissors", emoji="✂️", style=discord.ButtonStyle.secondary)
+    async def scissors(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.resolve(interaction, "✂️ Scissors")
+
+
+@bot.hybrid_command()
+async def rps(ctx):
+    """Play rock-paper-scissors against the bot — click a button to choose. Usage: !rps"""
+    await ctx.send(embed=discord.Embed(title="🪨📄✂️ Rock, Paper, Scissors", description="Pick your move!", color=discord.Color.blurple()), view=RPSView(author_id=ctx.author.id))
+
+
+EIGHT_BALL_ANSWERS = [
+    "It is certain.", "Without a doubt.", "You may rely on it.", "Yes, definitely.",
+    "It is decidedly so.", "As I see it, yes.", "Most likely.", "Outlook good.",
+    "Signs point to yes.", "Yes.", "Reply hazy, try again.", "Ask again later.",
+    "Better not tell you now.", "Cannot predict now.", "Concentrate and ask again.",
+    "Don't count on it.", "My reply is no.", "My sources say no.",
+    "Outlook not so good.", "Very doubtful.",
+]
+
+
+@bot.hybrid_command(name="8ball")
+@discord.app_commands.describe(question="What do you want to ask?")
+async def eight_ball(ctx, *, question: str):
+    """Ask the magic 8-ball a question. Usage: !8ball Will I win the lottery?"""
+    embed = discord.Embed(color=discord.Color.blurple())
+    embed.add_field(name="🎱 Question", value=question, inline=False)
+    embed.add_field(name="Answer", value=random.choice(EIGHT_BALL_ANSWERS), inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+async def coinflip(ctx):
+    """Flips a coin. Usage: !coinflip"""
+    await ctx.send(embed=discord.Embed(description=f"🪙 **{random.choice(['Heads', 'Tails'])}!**", color=discord.Color.gold()))
+
+
+@bot.hybrid_command()
+@discord.app_commands.describe(dice="Format: NdN, e.g. 2d6 for two six-sided dice (defaults to 1d6)")
+async def roll(ctx, dice: str = "1d6"):
+    """Rolls dice. Usage: !roll 2d6"""
+    match = re.match(r"^(\d{1,2})d(\d{1,4})$", dice.strip().lower())
+    if not match:
+        await ctx.send(embed=discord.Embed(description="Format is `NdN` — e.g. `2d6` or `1d20`.", color=discord.Color.red()))
+        return
+    count, sides = int(match.group(1)), int(match.group(2))
+    if count < 1 or sides < 2:
+        await ctx.send(embed=discord.Embed(description="Need at least 1 die with at least 2 sides.", color=discord.Color.red()))
+        return
+    rolls = [random.randint(1, sides) for _ in range(count)]
+    embed = discord.Embed(
+        title=f"🎲 Rolling {dice}",
+        description=f"Result: {', '.join(str(r) for r in rolls)}\n**Total: {sum(rolls)}**",
+        color=discord.Color.blurple(),
+    )
+    await ctx.send(embed=embed)
+
+
+JOKES = [
+    "Why don't scientists trust atoms? Because they make up everything.",
+    "I told my computer I needed a break, and it said no problem — it froze immediately.",
+    "Why do programmers prefer dark mode? Because light attracts bugs.",
+    "I would tell you a UDP joke, but you might not get it.",
+    "Why did the developer go broke? Because they used up all their cache.",
+    "There are 10 types of people: those who understand binary, and those who don't.",
+    "Why do Java developers wear glasses? Because they don't C#.",
+    "A SQL query walks into a bar, walks up to two tables and asks: 'Can I join you?'",
+]
+
+
+@bot.hybrid_command()
+async def joke(ctx):
+    """Tells a random joke. Usage: !joke"""
+    await ctx.send(embed=discord.Embed(description=random.choice(JOKES), color=discord.Color.blurple()))
 
 
 # ============================================================
@@ -1981,10 +2213,31 @@ def parse_duration(text: str):
     return total if total > 0 else None
 
 
+def parse_hex_color(text: str):
+    """Parses a hex color string like '#5865F2' or '5865F2' into a discord.Color.
+    Returns None if text is empty/invalid, so callers can fall back to a default color."""
+    if not text:
+        return None
+    cleaned = text.strip().lstrip("#")
+    if len(cleaned) != 6:
+        return None
+    try:
+        return discord.Color(int(cleaned, 16))
+    except ValueError:
+        return None
+
+
 @bot.hybrid_command()
 @commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
-async def giveaway(ctx, duration: str, winners: int, *, prize: str):
+@discord.app_commands.describe(
+    duration="How long the giveaway runs, e.g. 10m, 2h, 1d, 1d12h",
+    winners="How many winners to pick",
+    prize="What's being given away",
+    image="Optional image URL — shown as a big banner on the giveaway embed",
+    color="Optional hex color for the embed's side bar, e.g. #FF6EC7",
+)
+async def giveaway(ctx, duration: str, winners: int, prize: str, image: str = None, color: str = None):
     """Starts a giveaway with a real 'Enter' button (click again to leave). Usage:
     !giveaway 1h 1 Nitro Classic
     Duration examples: 30s, 10m, 2h, 1d, or combined like 1d12h."""
@@ -1997,12 +2250,15 @@ async def giveaway(ctx, duration: str, winners: int, *, prize: str):
         return
 
     end_time = datetime.datetime.now(datetime.timezone.utc).timestamp() + seconds
+    embed_color = parse_hex_color(color) or discord.Color.fuchsia()
     embed = discord.Embed(
         title="🎉 GIVEAWAY 🎉",
         description=(f"**{prize}**\n\nClick the button below to enter!\n"
                       f"Ends: <t:{int(end_time)}:R>\nWinners: **{winners}**\nHosted by: {ctx.author.mention}"),
-        color=discord.Color.fuchsia(),
+        color=embed_color,
     )
+    if image:
+        embed.set_image(url=image)
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="🎉 Enter", style=discord.ButtonStyle.success, custom_id="giveaway_enter:pending"))
     msg = await ctx.send(embed=embed, view=view)
@@ -2415,6 +2671,89 @@ async def ban(ctx, member: discord.Member, *, reason="No reason given"):
     await ctx.send(embed=discord.Embed(description=f"🔨 Banned {member.mention}.\nReason: {reason}{dm_note}", color=discord.Color.dark_red()))
     # Note: on_member_ban also fires and logs this via the audit log — that's fine as a backup,
     # duplicate log entries just mean extra confirmation.
+
+
+# ============================================================
+# GLOBAL BANS — bot-creator only. Bans someone from EVERY server the bot is in at once, and
+# remembers them so they're auto-banned in any server the bot joins later, or if they try to
+# rejoin anywhere. This is what anti-raid auto-bans use too — a raid ban isn't just local to
+# the server that got raided, it follows that account everywhere the bot has a presence.
+# ============================================================
+async def apply_global_ban(user_id: int, reason: str):
+    """Bans a user from every server the bot is currently in. Returns (success_count, [server
+    names it couldn't ban in])."""
+    success = 0
+    failed = []
+    user_obj = discord.Object(id=user_id)
+    for guild in bot.guilds:
+        try:
+            await guild.ban(user_obj, reason=reason)
+            success += 1
+        except discord.HTTPException:
+            failed.append(guild.name)
+    return success, failed
+
+
+@bot.hybrid_command()
+@owner_only()
+@discord.app_commands.describe(user="The user to ban from every server", reason="Why they're being globally banned")
+async def globalban(ctx, user: discord.User, *, reason: str = "No reason given"):
+    """Bot-creator only. Bans this user from EVERY server the bot is currently in, and
+    remembers them so they're auto-banned in any server the bot joins later, or if they try
+    to rejoin anywhere it's already in. Usage: !globalban @troublemaker Cross-server harassment"""
+    global_bans_data[str(user.id)] = {"reason": reason, "banned_by": ctx.author.id, "timestamp": datetime.datetime.now(datetime.timezone.utc).timestamp()}
+    save_json(GLOBAL_BANS_FILE, global_bans_data)
+
+    success, failed = await apply_global_ban(user.id, f"GLOBAL BAN by bot owner: {reason}")
+
+    embed = discord.Embed(
+        title="🌐 Global Ban Applied",
+        description=f"Banned **{user}** in **{success}/{len(bot.guilds)}** server(s).\nReason: {reason}",
+        color=discord.Color.dark_red(),
+    )
+    if failed:
+        embed.add_field(name="⚠️ Couldn't ban in", value=", ".join(failed)[:1024], inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+@owner_only()
+@discord.app_commands.describe(user="The user to lift the global ban from")
+async def globalunban(ctx, user: discord.User):
+    """Bot-creator only. Removes a global ban — unbans them in every server where they were
+    banned via !globalban (or an anti-raid global ban), and stops auto-banning them in the
+    future. Usage: !globalunban @user"""
+    was_tracked = global_bans_data.pop(str(user.id), None)
+    save_json(GLOBAL_BANS_FILE, global_bans_data)
+
+    success = 0
+    failed = []
+    for guild in bot.guilds:
+        try:
+            await guild.unban(user, reason=f"Global ban lifted by bot owner ({ctx.author})")
+            success += 1
+        except discord.NotFound:
+            pass  # wasn't banned there — nothing to do
+        except discord.HTTPException:
+            failed.append(guild.name)
+
+    embed = discord.Embed(description=f"✅ Lifted the global ban on **{user}** — unbanned in {success} server(s) where they were banned.", color=discord.Color.green())
+    if not was_tracked:
+        embed.description += "\n(They weren't on the tracked global-ban list, but I tried unbanning everywhere just in case.)"
+    if failed:
+        embed.add_field(name="⚠️ Couldn't unban in", value=", ".join(failed)[:1024], inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+@owner_only()
+async def globalbanlist(ctx):
+    """Bot-creator only. Lists everyone currently on the global ban list. Usage: !globalbanlist"""
+    if not global_bans_data:
+        await ctx.send(embed=discord.Embed(description="No one is globally banned right now.", color=discord.Color.greyple()))
+        return
+    lines = [f"<@{uid}> (`{uid}`) — {data.get('reason', 'No reason given')}" for uid, data in global_bans_data.items()]
+    await ctx.send(embed=discord.Embed(title="🌐 Global Ban List", description="\n".join(lines)[:4000], color=discord.Color.dark_red()))
 
 
 # ============================================================
@@ -2905,7 +3244,7 @@ async def listbackups(ctx):
 # ============================================================
 DATA_FILES_FOR_EXPORT = [
     ROLES_FILE, LEVELS_FILE, REACTION_ROLES_FILE, AFK_FILE,
-    GUILD_SETTINGS_FILE, BIRTHDAYS_FILE, GIVEAWAYS_FILE, STARBOARD_FILE, INVITES_FILE,
+    GUILD_SETTINGS_FILE, BIRTHDAYS_FILE, GIVEAWAYS_FILE, STARBOARD_FILE, INVITES_FILE, GLOBAL_BANS_FILE,
 ]
 
 
@@ -2941,6 +3280,7 @@ def reload_all_data():
     refresh(giveaways_data, GIVEAWAYS_FILE)
     refresh(starboard_data, STARBOARD_FILE)
     refresh(invite_data, INVITES_FILE)
+    refresh(global_bans_data, GLOBAL_BANS_FILE)
 
 
 @bot.hybrid_command()
