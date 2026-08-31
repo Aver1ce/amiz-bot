@@ -716,6 +716,50 @@ async def on_raw_reaction_remove(payload):
         await update_starboard(payload)
 
 
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    """Raw handler for the persistent role-menu and giveaway-enter buttons. Deliberately NOT
+    built on discord.py's View/callback system — a plain button with just a custom_id is
+    enough, since everything it needs (the role ID, or the giveaway's message ID) is encoded
+    directly in that custom_id. That means these buttons keep working forever, even across
+    bot restarts, with no re-registration step needed on startup."""
+    if interaction.type != discord.InteractionType.component:
+        return
+    custom_id = interaction.data.get("custom_id", "") if interaction.data else ""
+
+    if custom_id.startswith("rolemenu:"):
+        role_id = int(custom_id.split(":", 1)[1])
+        role = interaction.guild.get_role(role_id) if interaction.guild else None
+        if role is None:
+            await interaction.response.send_message("That role doesn't exist anymore.", ephemeral=True)
+            return
+        member = interaction.user
+        try:
+            if role in member.roles:
+                await member.remove_roles(role, reason="Role menu button")
+                await interaction.response.send_message(f"➖ Removed **{role.name}**.", ephemeral=True)
+            else:
+                await member.add_roles(role, reason="Role menu button")
+                await interaction.response.send_message(f"➕ Gave you **{role.name}**.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("I don't have permission to manage that role — check my role's position in the server's role list (I need to be above it).", ephemeral=True)
+
+    elif custom_id.startswith("giveaway_enter:"):
+        message_id = custom_id.split(":", 1)[1]
+        data = giveaways_data.get(message_id)
+        if data is None:
+            await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
+            return
+        entrants = data.setdefault("entrants", [])
+        if interaction.user.id in entrants:
+            entrants.remove(interaction.user.id)
+            await interaction.response.send_message("➖ You left the giveaway.", ephemeral=True)
+        else:
+            entrants.append(interaction.user.id)
+            await interaction.response.send_message("🎉 You're entered! Good luck!", ephemeral=True)
+        save_json(GIVEAWAYS_FILE, giveaways_data)
+
+
 @bot.hybrid_command()
 @commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
@@ -811,6 +855,31 @@ async def createreactionrole(ctx, emoji: str, role: discord.Role, *, label: str 
     reaction_roles.setdefault(str(msg.id), {})[emoji] = role.id
     save_json(REACTION_ROLES_FILE, reaction_roles)
     await ctx.send(embed=discord.Embed(description=f"✅ Done! That message above is now live — react to it and you'll get **{role.name}**.", color=discord.Color.green()), delete_after=8)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_roles=True)
+@discord.app_commands.describe(
+    title="Title shown at the top of the menu",
+    role1="First role", role2="Second role (optional)", role3="Third role (optional)",
+    role4="Fourth role (optional)", role5="Fifth role (optional)",
+    description="Optional text under the title (defaults to a simple instruction)",
+)
+async def rolemenu(ctx, title: str, role1: discord.Role, role2: discord.Role = None,
+                    role3: discord.Role = None, role4: discord.Role = None, role5: discord.Role = None,
+                    description: str = None):
+    """Posts a button-based self-role menu — click a button to get that role, click it again
+    to remove it. No reactions involved, and it keeps working after a bot restart (each
+    button carries its own role, so nothing needs to be re-registered on startup).
+    Usage: !rolemenu "Pick your pings" @VC @Announcements @Events @Giveaways
+    Usable by anyone with Manage Roles (Administrators included) or the bot owner."""
+    roles = [r for r in (role1, role2, role3, role4, role5) if r is not None]
+    embed = discord.Embed(title=title, description=description or "Click a button below to toggle a role.", color=discord.Color.blurple())
+    view = discord.ui.View(timeout=None)
+    for role in roles:
+        view.add_item(discord.ui.Button(label=role.name[:80], style=discord.ButtonStyle.secondary, custom_id=f"rolemenu:{role.id}"))
+    await ctx.send(embed=embed, view=view)
 
 
 @bot.hybrid_command()
@@ -1916,7 +1985,8 @@ def parse_duration(text: str):
 @commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def giveaway(ctx, duration: str, winners: int, *, prize: str):
-    """Starts a giveaway. Usage: !giveaway 1h 1 Nitro Classic
+    """Starts a giveaway with a real 'Enter' button (click again to leave). Usage:
+    !giveaway 1h 1 Nitro Classic
     Duration examples: 30s, 10m, 2h, 1d, or combined like 1d12h."""
     seconds = parse_duration(duration)
     if not seconds:
@@ -1929,16 +1999,22 @@ async def giveaway(ctx, duration: str, winners: int, *, prize: str):
     end_time = datetime.datetime.now(datetime.timezone.utc).timestamp() + seconds
     embed = discord.Embed(
         title="🎉 GIVEAWAY 🎉",
-        description=(f"**{prize}**\n\nReact with 🎉 to enter!\n"
+        description=(f"**{prize}**\n\nClick the button below to enter!\n"
                       f"Ends: <t:{int(end_time)}:R>\nWinners: **{winners}**\nHosted by: {ctx.author.mention}"),
         color=discord.Color.fuchsia(),
     )
-    msg = await ctx.send(embed=embed)
-    await msg.add_reaction("🎉")
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="🎉 Enter", style=discord.ButtonStyle.success, custom_id="giveaway_enter:pending"))
+    msg = await ctx.send(embed=embed, view=view)
+
+    # The button's custom_id needs the real message ID, which only exists after sending —
+    # so edit it in now that we have one.
+    view.children[0].custom_id = f"giveaway_enter:{msg.id}"
+    await msg.edit(view=view)
 
     giveaways_data[str(msg.id)] = {
         "guild_id": ctx.guild.id, "channel_id": ctx.channel.id, "prize": prize,
-        "winners": winners, "end_time": end_time, "host_id": ctx.author.id,
+        "winners": winners, "end_time": end_time, "host_id": ctx.author.id, "entrants": [],
     }
     save_json(GIVEAWAYS_FILE, giveaways_data)
 
@@ -1957,8 +2033,8 @@ async def end_giveaway(message_id: str, data: dict):
         save_json(GIVEAWAYS_FILE, giveaways_data)
         return
 
-    reaction = discord.utils.get(message.reactions, emoji="🎉")
-    entrants = [user async for user in reaction.users() if not user.bot] if reaction else []
+    entrants = [guild.get_member(uid) for uid in data.get("entrants", [])]
+    entrants = [m for m in entrants if m is not None]  # drop anyone who left the server
 
     if entrants:
         pick_count = min(data["winners"], len(entrants))
@@ -1975,7 +2051,7 @@ async def end_giveaway(message_id: str, data: dict):
         color=discord.Color.dark_grey(),
     )
     try:
-        await message.edit(embed=ended_embed)
+        await message.edit(embed=ended_embed, view=None)
     except discord.Forbidden:
         pass
     await channel.send(embed=discord.Embed(description=result_text, color=discord.Color.gold()))
@@ -2009,20 +2085,16 @@ async def gend(ctx, message_id: str):
 @bot.hybrid_command()
 @has_permissions_or_owner(manage_guild=True)
 async def greroll(ctx, message_id: str):
-    """Re-picks one winner for an ALREADY-ENDED giveaway. Run this in the same channel
-    the giveaway was posted in. Usage: !greroll <message_id>"""
-    try:
-        message = await ctx.channel.fetch_message(int(message_id))
-    except (discord.NotFound, discord.Forbidden, ValueError):
-        await ctx.send(embed=discord.Embed(description="Couldn't find that message in this channel.", color=discord.Color.red()))
+    """Re-picks one winner for an ALREADY-ENDED giveaway. Usage: !greroll <message_id>"""
+    data = giveaways_data.get(message_id)
+    entrant_ids = data.get("entrants", []) if data else []
+    if not entrant_ids:
+        await ctx.send(embed=discord.Embed(description="No stored entrants to reroll from for that giveaway (either it's too old, or nobody entered).", color=discord.Color.red()))
         return
-
-    reaction = discord.utils.get(message.reactions, emoji="🎉")
-    entrants = [user async for user in reaction.users() if not user.bot] if reaction else []
+    entrants = [m for m in (ctx.guild.get_member(uid) for uid in entrant_ids) if m is not None]
     if not entrants:
-        await ctx.send(embed=discord.Embed(description="No valid entrants to reroll from.", color=discord.Color.red()))
+        await ctx.send(embed=discord.Embed(description="Nobody who entered is still in the server.", color=discord.Color.red()))
         return
-
     winner = random.choice(entrants)
     await ctx.send(embed=discord.Embed(description=f"🎉 New winner: {winner.mention}!", color=discord.Color.fuchsia()))
 
@@ -2960,8 +3032,40 @@ async def leavevc(ctx):
 # "ANNI" — bot-creator-only, permanent deletion commands. Named after "annihilate": these
 # don't archive or soft-delete anything, they call Discord's real delete endpoints. There is
 # no undo beyond restoring a backup made BEFORE running one of these (!backupserver /
-# !restoreserver). !anniserver asks for typed confirmation first since it wipes everything.
+# !restoreserver). !anniserver asks for button confirmation first since it wipes everything.
 # ============================================================
+class ConfirmView(discord.ui.View):
+    """A simple Confirm/Cancel button pair, restricted to whoever triggered it. Session-only
+    (not persistent across restarts) since it's meant for an immediate one-shot decision,
+    not something that should still be clickable days later."""
+    def __init__(self, author_id: int, timeout: float = 30):
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.confirmed = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("This confirmation isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = False
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+
 @bot.hybrid_command()
 @commands.guild_only()
 @owner_only()
@@ -3048,25 +3152,22 @@ async def annicategory(ctx, category: discord.CategoryChannel):
 @owner_only()
 async def anniserver(ctx):
     """Bot-creator only. PERMANENTLY deletes EVERY channel, category, and custom role in
-    THIS server — gone, not archived. Asks you to type `confirm` first since it cannot be
+    THIS server — gone, not archived. Asks you to click Confirm first since it cannot be
     undone (short of restoring a backup made beforehand). Usage: !anniserver"""
     guild = ctx.guild
-    await ctx.send(embed=discord.Embed(
+    view = ConfirmView(author_id=ctx.author.id, timeout=30)
+    confirm_msg = await ctx.send(embed=discord.Embed(
         title="⚠️ Are you absolutely sure?",
-        description=f"This will permanently delete **every channel, category, and custom role** in **{guild.name}**. This cannot be undone.\n\nType `confirm` within 30 seconds to proceed, or anything else (or nothing) to cancel.",
+        description=f"This will permanently delete **every channel, category, and custom role** in **{guild.name}**. This cannot be undone.\n\nClick **Confirm** within 30 seconds to proceed.",
         color=discord.Color.red(),
-    ))
+    ), view=view)
 
-    def check(m):
-        return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
-
-    try:
-        reply = await bot.wait_for("message", check=check, timeout=30)
-    except asyncio.TimeoutError:
-        await ctx.send(embed=discord.Embed(description="⏱️ Timed out — nothing was deleted.", color=discord.Color.greyple()))
+    timed_out = await view.wait()
+    if timed_out:
+        await confirm_msg.edit(embed=discord.Embed(description="⏱️ Timed out — nothing was deleted.", color=discord.Color.greyple()), view=None)
         return
-    if reply.content.strip().lower() != "confirm":
-        await ctx.send(embed=discord.Embed(description="Cancelled — nothing was deleted.", color=discord.Color.greyple()))
+    if not view.confirmed:
+        await confirm_msg.edit(embed=discord.Embed(description="Cancelled — nothing was deleted.", color=discord.Color.greyple()), view=None)
         return
 
     guilds_in_bulk_delete.add(guild.id)
