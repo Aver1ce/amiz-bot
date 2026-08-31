@@ -2930,8 +2930,9 @@ async def joinvc(ctx, channel: discord.VoiceChannel = None):
         else:
             await channel.connect(reconnect=True)
     except (discord.ClientException, RuntimeError) as e:
-        if "PyNaCl" in str(e):
-            await ctx.send(embed=discord.Embed(title="⚠️ Error — MISSING_DEPENDENCY", description="This host doesn't have **PyNaCl** installed, which is required for voice. Add `PyNaCl` to requirements.txt and redeploy — voice can't work without it.", color=discord.Color.red()))
+        missing_pkg = "PyNaCl" if "PyNaCl" in str(e) else ("davey" if "davey" in str(e) else None)
+        if missing_pkg:
+            await ctx.send(embed=discord.Embed(title="⚠️ Error — MISSING_DEPENDENCY", description=f"This host doesn't have **{missing_pkg}** installed, which voice requires. Add `{missing_pkg}` to requirements.txt and do a full reinstall (not just a restart) — voice can't work without it.", color=discord.Color.red()))
         else:
             await ctx.send(embed=discord.Embed(title="⚠️ Error — VOICE_ERROR", description=f"Couldn't join — {e}", color=discord.Color.red()))
         return
