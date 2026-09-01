@@ -199,9 +199,11 @@ invite_data = load_json(INVITES_FILE)
 # global_bans.json format: {"user_id": {"reason", "banned_by", "timestamp"}} — anyone here
 # gets banned from every server the bot is in, and auto-banned in any server it joins later
 global_bans_data = load_json(GLOBAL_BANS_FILE)
-# activity.json format: {"guild_id": {"user_id": {"messages": int, "voice_seconds": float}}} —
-# raw activity counts, tracked separately from XP/levels so it still works even if a server
-# has leveling turned off. Used for chat/voice leaderboards and the "most active" roles.
+# activity.json format: {"guild_id": {"user_id": {"daily": {"YYYY-MM-DD": {"messages": int,
+# "voice_seconds": float}}}}} — day-bucketed so "most active" can mean genuinely/recently
+# active (a rolling window, see ACTIVE_WINDOW_DEFAULT_DAYS) rather than an all-time total
+# someone could win once and hold forever. Tracked separately from XP/levels so it still
+# works even if a server has leveling turned off. Old buckets get pruned periodically.
 activity_data = load_json(ACTIVITY_FILE)
 guild_invite_cache = {}  # runtime only: guild_id -> {invite_code: uses} snapshot, used to spot
                           # which invite's use-count went up when someone joins
@@ -436,7 +438,9 @@ HELP_CATEGORIES = {
             "`bannedwords` `showsettings`\n"
             "`setmemberrole` `setbotrole` — auto-role new humans/bots on join\n"
             "`setupserverstats` `removeserverstats` — live member/human/bot count channels\n"
-            "`setactivechatrole` `setactivevoicerole` — auto-role for the #1 most active member"
+            "`setactivechatrole` `setactivevoicerole` `setactiveoverallrole` — auto-role for EVERYONE who's genuinely active weekly\n"
+            "`setyapperrole` `setgrandyapperrole` — single-holder \"most messages today/this week\" roles\n"
+            "`setactivitywindow` — how many recent days count toward that"
         ),
     },
     "moderation": {
@@ -454,7 +458,7 @@ HELP_CATEGORIES = {
         "description": "XP progress, level-up role rewards, activity leaderboards, and self-role menus.",
         "commands": (
             "`rank` `leaderboard` `globalleaderboard` `setlevel` `addxp`\n"
-            "`chatleaderboard` `vcleaderboard` — most active members, by messages/voice time\n"
+            "`chatleaderboard` `vcleaderboard` `overallleaderboard` — most active members, by messages/voice/combined\n"
             "`rolemenu` — button-based self-roles (recommended!)\n"
             "`reactionrole` `createreactionrole` `removereactionrole` — older, reaction-based"
         ),
@@ -1379,108 +1383,255 @@ async def update_server_stats_for_guild(guild: discord.Guild):
 
 # ============================================================
 # ACTIVITY LEADERBOARDS & "MOST ACTIVE" ROLES — tracks raw chat/voice activity (separate
-# from XP/levels, so it keeps working even with leveling turned off) and can auto-give a
-# role to whoever's currently #1 in chat and #1 in voice, per server. Only one person holds
-# each role at a time — it moves the moment someone else takes the top spot.
+# from XP/levels, so it keeps working even with leveling turned off). The active-chat/
+# active-voice/active-overall roles are GROUP roles: everyone who clears the activity bar
+# holds it at once, not just a single #1. The Yapper roles are the opposite — single-holder,
+# purely competitive "who talked the most today/this week", no minimum bar required.
 # ============================================================
 @bot.hybrid_command()
 @commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
-@discord.app_commands.describe(role="Role to give whoever is currently #1 for messages sent (leave blank to turn off)")
+@discord.app_commands.describe(role="Role to give EVERY member who's genuinely active in chat this week (leave blank to turn off)")
 async def setactivechatrole(ctx, role: discord.Role = None):
-    """Auto-gives a role to whoever is CURRENTLY the most active chatter in THIS server —
-    moves to someone else the moment they take the top spot. Usage: !setactivechatrole @Top Chatter"""
+    """Auto-gives a role ('Top Active Weekly' is a good name for it) to EVERY member who
+    clears the chat-activity bar in the recent window (weekly by default) — if 8 people
+    qualify, all 8 get it, not just #1. Taken back the moment someone stops qualifying.
+    Usage: !setactivechatrole @Top Active Weekly"""
     settings = guild_settings.setdefault(str(ctx.guild.id), {})
     if role is None:
         settings.pop("active_chat_role", None)
         save_json(GUILD_SETTINGS_FILE, guild_settings)
-        await ctx.send(embed=discord.Embed(description="🛑 Turned off the most-active-chatter role.", color=discord.Color.orange()))
+        await ctx.send(embed=discord.Embed(description="🛑 Turned off the active-chatters role.", color=discord.Color.orange()))
         return
     settings["active_chat_role"] = role.id
     save_json(GUILD_SETTINGS_FILE, guild_settings)
     await sync_active_roles(ctx.guild)
-    await ctx.send(embed=discord.Embed(description=f"✅ {role.mention} will now follow whoever's #1 in chat activity — updates roughly every 10 minutes.", color=discord.Color.green()))
+    await ctx.send(embed=discord.Embed(description=f"✅ {role.mention} will now be given to everyone who's genuinely active in chat this week — updates roughly every 10 minutes.", color=discord.Color.green()))
 
 
 @bot.hybrid_command()
 @commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
-@discord.app_commands.describe(role="Role to give whoever is currently #1 for voice time (leave blank to turn off)")
+@discord.app_commands.describe(role="Role to give EVERY member who's genuinely active in voice this week (leave blank to turn off)")
 async def setactivevoicerole(ctx, role: discord.Role = None):
-    """Auto-gives a role to whoever is CURRENTLY the most active in voice in THIS server —
-    moves to someone else the moment they take the top spot. Usage: !setactivevoicerole @Top Voice"""
+    """Auto-gives a role ('Top Voice Active Weekly' is a good name for it) to EVERY member
+    who clears the voice-activity bar in the recent window (weekly by default) — if 8 people
+    qualify, all 8 get it, not just #1. Taken back the moment someone stops qualifying.
+    Usage: !setactivevoicerole @Top Voice Active Weekly"""
     settings = guild_settings.setdefault(str(ctx.guild.id), {})
     if role is None:
         settings.pop("active_voice_role", None)
         save_json(GUILD_SETTINGS_FILE, guild_settings)
-        await ctx.send(embed=discord.Embed(description="🛑 Turned off the most-active-in-voice role.", color=discord.Color.orange()))
+        await ctx.send(embed=discord.Embed(description="🛑 Turned off the active-in-voice role.", color=discord.Color.orange()))
         return
     settings["active_voice_role"] = role.id
     save_json(GUILD_SETTINGS_FILE, guild_settings)
     await sync_active_roles(ctx.guild)
-    await ctx.send(embed=discord.Embed(description=f"✅ {role.mention} will now follow whoever's #1 in voice activity — updates roughly every 10 minutes.", color=discord.Color.green()))
+    await ctx.send(embed=discord.Embed(description=f"✅ {role.mention} will now be given to everyone who's genuinely active in voice this week — updates roughly every 10 minutes.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(role="Role to give EVERY member who's genuinely active overall this week — chat AND voice combined (leave blank to turn off)")
+async def setactiveoverallrole(ctx, role: discord.Role = None):
+    """Auto-gives a role to EVERY member who clears an overall chat+voice activity bar this
+    week (weighted using this server's own XP-per-message and XP-per-voice-minute settings)
+    — everyone who qualifies gets it, not just #1. A different, separate role from
+    !setactivechatrole / !setactivevoicerole — someone great at both could hold all three.
+    Usage: !setactiveoverallrole @Active Overall"""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    if role is None:
+        settings.pop("active_overall_role", None)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description="🛑 Turned off the active-overall role.", color=discord.Color.orange()))
+        return
+    settings["active_overall_role"] = role.id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await sync_active_roles(ctx.guild)
+    await ctx.send(embed=discord.Embed(description=f"✅ {role.mention} will now be given to everyone who's genuinely active overall this week — updates roughly every 10 minutes.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(role="Role for whoever's sent the most messages TODAY (leave blank to turn off)")
+async def setyapperrole(ctx, role: discord.Role = None):
+    """Auto-gives a role ('Certified Yapper' is a good name for it) to whoever's sent the
+    most messages TODAY in this server — resets fresh every day, no minimum required, just
+    whoever talked the most. Only one person holds it at a time.
+    Usage: !setyapperrole @Certified Yapper"""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    if role is None:
+        settings.pop("yapper_role", None)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description="🛑 Turned off the daily top-chatter role.", color=discord.Color.orange()))
+        return
+    settings["yapper_role"] = role.id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await sync_active_roles(ctx.guild)
+    await ctx.send(embed=discord.Embed(description=f"✅ {role.mention} now goes to whoever's sent the most messages TODAY — resets daily.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(role="Role for whoever's sent the most messages THIS WEEK (leave blank to turn off)")
+async def setgrandyapperrole(ctx, role: discord.Role = None):
+    """Auto-gives a role ('Grand Yapper Supreme' is a good name for it) to whoever's sent
+    the most messages THIS WEEK (a fixed 7-day window) in this server — no minimum
+    required, just whoever talked the most. Only one person holds it at a time.
+    Usage: !setgrandyapperrole @Grand Yapper Supreme"""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    if role is None:
+        settings.pop("grand_yapper_role", None)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description="🛑 Turned off the weekly top-chatter role.", color=discord.Color.orange()))
+        return
+    settings["grand_yapper_role"] = role.id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await sync_active_roles(ctx.guild)
+    await ctx.send(embed=discord.Embed(description=f"✅ {role.mention} now goes to whoever's sent the most messages THIS WEEK — resets weekly.", color=discord.Color.green()))
 
 
 async def sync_active_roles(guild: discord.Guild):
-    """Makes sure the configured 'most active' roles (chat/voice) are held by ONLY whoever
-    is currently #1 in each — takes it back from a previous holder who's no longer on top."""
+    """Keeps the 'Top Active Weekly' / 'Top Voice Active Weekly' / overall-active roles held
+    by EVERY member who currently clears the activity bar — not just #1. 8 people qualify?
+    All 8 get it. Ranked over the last N days (default weekly), so it reflects who's
+    genuinely active lately, not an all-time total someone could win once and keep forever.
+    Also re-syncs the single-holder 'Certified Yapper' (today) and 'Grand Yapper Supreme'
+    (this week) novelty roles, which work differently — see sync_yapper_roles below."""
     settings = guild_settings.get(str(guild.id), {})
-    guild_activity = activity_data.get(str(guild.id), {})
-    if not guild_activity:
+    window_days = settings.get("active_window_days", ACTIVE_WINDOW_DEFAULT_DAYS)
+    recent = get_recent_activity(guild.id, window_days)
+
+    await apply_qualifying_group(guild, settings.get("active_chat_role"), {uid: d.get("messages", 0) for uid, d in recent.items()}, ACTIVE_ROLE_MIN_MESSAGES)
+    await apply_qualifying_group(guild, settings.get("active_voice_role"), {uid: d.get("voice_seconds", 0) for uid, d in recent.items()}, ACTIVE_ROLE_MIN_VOICE_MINUTES * 60)
+    await apply_qualifying_group(guild, settings.get("active_overall_role"), get_overall_activity_score(guild.id, recent), ACTIVE_ROLE_MIN_OVERALL_SCORE)
+    await sync_yapper_roles(guild)
+
+
+async def apply_qualifying_group(guild: discord.Guild, role_id, scores: dict, minimum: float):
+    """Gives the role to EVERY member whose score clears the minimum, and takes it back from
+    anyone holding it who no longer does — a group of qualifiers, not a single #1."""
+    if not role_id:
+        return
+    role = guild.get_role(role_id)
+    if role is None:
         return
 
-    for setting_key, metric in (("active_chat_role", "messages"), ("active_voice_role", "voice_seconds")):
-        role_id = settings.get(setting_key)
-        if not role_id:
-            continue
-        role = guild.get_role(role_id)
-        if role is None:
-            continue
+    qualifying_members = set()
+    for user_id_str, score in scores.items():
+        if score >= minimum:
+            member = guild.get_member(int(user_id_str))
+            if member:
+                qualifying_members.add(member)
 
-        ranked = sorted(guild_activity.items(), key=lambda kv: kv[1].get(metric, 0), reverse=True)
-        top_user_id = int(ranked[0][0]) if ranked and ranked[0][1].get(metric, 0) > 0 else None
-        top_member = guild.get_member(top_user_id) if top_user_id else None
-
-        for member in role.members:
-            if member != top_member:
-                try:
-                    await member.remove_roles(role, reason="No longer the most active member")
-                except discord.Forbidden:
-                    pass
-        if top_member and role not in top_member.roles:
+    for member in role.members:
+        if member not in qualifying_members:
             try:
-                await top_member.add_roles(role, reason="Currently the most active member")
+                await member.remove_roles(role, reason="No longer clears the recent activity bar")
             except discord.Forbidden:
                 pass
+    for member in qualifying_members:
+        if role not in member.roles:
+            try:
+                await member.add_roles(role, reason="Clears the recent activity bar")
+            except discord.Forbidden:
+                pass
+
+
+async def apply_single_top_holder(guild: discord.Guild, role_id, scores: dict, reason: str):
+    """Gives the role to ONLY whoever scores highest — for the competitive/novelty Yapper
+    roles, where it's specifically about being #1, not about clearing a bar."""
+    if not role_id:
+        return
+    role = guild.get_role(role_id)
+    if role is None:
+        return
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    top_user_id = int(ranked[0][0]) if ranked and ranked[0][1] > 0 else None
+    top_member = guild.get_member(top_user_id) if top_user_id else None
+
+    for member in role.members:
+        if member != top_member:
+            try:
+                await member.remove_roles(role, reason="No longer the top yapper")
+            except discord.Forbidden:
+                pass
+    if top_member and role not in top_member.roles:
+        try:
+            await top_member.add_roles(role, reason=reason)
+        except discord.Forbidden:
+            pass
+
+
+async def sync_yapper_roles(guild: discord.Guild):
+    """'Certified Yapper' — whoever's sent the most messages TODAY (resets fresh every day).
+    'Grand Yapper Supreme' — whoever's sent the most messages THIS WEEK (a fixed 7-day
+    window, separate from the adjustable !setactivitywindow setting, since 'weekly' is part
+    of the name). No minimum bar — purely 'who talked the most', just for fun."""
+    settings = guild_settings.get(str(guild.id), {})
+
+    today_scores = get_messages_for_day(guild.id, _today_key())
+    await apply_single_top_holder(guild, settings.get("yapper_role"), today_scores, "Certified Yapper of the day")
+
+    week_recent = get_recent_activity(guild.id, 7)
+    week_scores = {uid: d.get("messages", 0) for uid, d in week_recent.items()}
+    await apply_single_top_holder(guild, settings.get("grand_yapper_role"), week_scores, "Grand Yapper Supreme of the week")
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(days="How many days of activity count as 'recent' for the active roles and leaderboards")
+async def setactivitywindow(ctx, days: int):
+    """Sets how many days of RECENT activity count toward the most-active roles and the
+    leaderboards, in THIS server (default 14). A smaller window rewards who's active right
+    now; a bigger one smooths out day-to-day swings. Usage: !setactivitywindow 14"""
+    if days < 1 or days > ACTIVITY_RETENTION_DAYS:
+        await ctx.send(embed=discord.Embed(description=f"Pick something between 1 and {ACTIVITY_RETENTION_DAYS} days.", color=discord.Color.red()))
+        return
+    guild_settings.setdefault(str(ctx.guild.id), {})["active_window_days"] = days
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await sync_active_roles(ctx.guild)
+    await ctx.send(embed=discord.Embed(description=f"✅ Activity roles and leaderboards now look at the last **{days} day(s)**.", color=discord.Color.green()))
 
 
 @bot.hybrid_command()
 @commands.guild_only()
 async def chatleaderboard(ctx):
-    """Shows THIS server's top 10 most active members by messages sent."""
-    guild_activity = activity_data.get(str(ctx.guild.id), {})
-    ranked = sorted(guild_activity.items(), key=lambda kv: kv[1].get("messages", 0), reverse=True)
+    """Shows THIS server's top 10 most active members by messages sent, over the recent
+    activity window (default last 14 days — see !setactivitywindow)."""
+    window_days = guild_settings.get(str(ctx.guild.id), {}).get("active_window_days", ACTIVE_WINDOW_DEFAULT_DAYS)
+    recent = get_recent_activity(ctx.guild.id, window_days)
+    ranked = sorted(recent.items(), key=lambda kv: kv[1].get("messages", 0), reverse=True)
     ranked = [(uid, data) for uid, data in ranked if data.get("messages", 0) > 0][:10]
     if not ranked:
-        await ctx.send(embed=discord.Embed(description="No chat activity tracked yet.", color=discord.Color.greyple()))
+        await ctx.send(embed=discord.Embed(description="No chat activity tracked in the recent window yet.", color=discord.Color.greyple()))
         return
     lines = []
     for i, (user_id_str, data) in enumerate(ranked, start=1):
         member = ctx.guild.get_member(int(user_id_str))
         label = member.mention if member else f"<@{user_id_str}> (left server)"
         lines.append(f"**{i}.** {label} — {data.get('messages', 0)} message(s)")
-    await ctx.send(embed=discord.Embed(title=f"💬 Most Active — {ctx.guild.name}", description="\n".join(lines), color=discord.Color.blurple()))
+    embed = discord.Embed(title=f"💬 Most Active — {ctx.guild.name}", description="\n".join(lines), color=discord.Color.blurple())
+    embed.set_footer(text=f"Last {window_days} day(s) — not an all-time total")
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command()
 @commands.guild_only()
 async def vcleaderboard(ctx):
-    """Shows THIS server's top 10 most active members by time spent in voice."""
-    guild_activity = activity_data.get(str(ctx.guild.id), {})
-    ranked = sorted(guild_activity.items(), key=lambda kv: kv[1].get("voice_seconds", 0), reverse=True)
+    """Shows THIS server's top 10 most active members by time spent in voice, over the
+    recent activity window (default last 14 days — see !setactivitywindow)."""
+    window_days = guild_settings.get(str(ctx.guild.id), {}).get("active_window_days", ACTIVE_WINDOW_DEFAULT_DAYS)
+    recent = get_recent_activity(ctx.guild.id, window_days)
+    ranked = sorted(recent.items(), key=lambda kv: kv[1].get("voice_seconds", 0), reverse=True)
     ranked = [(uid, data) for uid, data in ranked if data.get("voice_seconds", 0) > 0][:10]
     if not ranked:
-        await ctx.send(embed=discord.Embed(description="No voice activity tracked yet.", color=discord.Color.greyple()))
+        await ctx.send(embed=discord.Embed(description="No voice activity tracked in the recent window yet.", color=discord.Color.greyple()))
         return
     lines = []
     for i, (user_id_str, data) in enumerate(ranked, start=1):
@@ -1490,13 +1641,45 @@ async def vcleaderboard(ctx):
         minutes = remainder // 60
         duration = f"{hours}h {minutes}m" if hours else f"{minutes}m"
         lines.append(f"**{i}.** {label} — {duration}")
-    await ctx.send(embed=discord.Embed(title=f"🎙️ Most Active (Voice) — {ctx.guild.name}", description="\n".join(lines), color=discord.Color.blurple()))
+    embed = discord.Embed(title=f"🎙️ Most Active (Voice) — {ctx.guild.name}", description="\n".join(lines), color=discord.Color.blurple())
+    embed.set_footer(text=f"Last {window_days} day(s) — not an all-time total")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def overallleaderboard(ctx):
+    """Shows THIS server's top 10 most active members OVERALL — chat and voice combined
+    into one score, weighted using this server's XP-per-message/XP-per-voice-minute
+    settings, over the recent activity window (default last 14 days)."""
+    window_days = guild_settings.get(str(ctx.guild.id), {}).get("active_window_days", ACTIVE_WINDOW_DEFAULT_DAYS)
+    recent = get_recent_activity(ctx.guild.id, window_days)
+    scores = get_overall_activity_score(ctx.guild.id, recent)
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    ranked = [(uid, score) for uid, score in ranked if score > 0][:10]
+    if not ranked:
+        await ctx.send(embed=discord.Embed(description="No activity tracked in the recent window yet.", color=discord.Color.greyple()))
+        return
+    lines = []
+    for i, (user_id_str, score) in enumerate(ranked, start=1):
+        member = ctx.guild.get_member(int(user_id_str))
+        label = member.mention if member else f"<@{user_id_str}> (left server)"
+        data = recent.get(user_id_str, {})
+        hours, remainder = divmod(int(data.get("voice_seconds", 0)), 3600)
+        minutes = remainder // 60
+        voice_str = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+        lines.append(f"**{i}.** {label} — {data.get('messages', 0)} msg, {voice_str} voice")
+    embed = discord.Embed(title=f"⭐ Most Active Overall — {ctx.guild.name}", description="\n".join(lines), color=discord.Color.gold())
+    embed.set_footer(text=f"Last {window_days} day(s), chat + voice combined — not an all-time total")
+    await ctx.send(embed=embed)
 
 
 @tasks.loop(minutes=10)
 async def server_stats_and_active_roles_update():
-    """Every 10 minutes: refreshes any server-stats channel names, and re-checks the
-    most-active-chat/voice roles in every server that has them configured."""
+    """Every 10 minutes: refreshes any server-stats channel names, re-checks the
+    most-active-chat/voice roles in every server that has them configured, and prunes old
+    activity data."""
+    prune_old_activity()
     for guild in bot.guilds:
         try:
             await update_server_stats_for_guild(guild)
@@ -2164,10 +2347,22 @@ async def grant_xp(member, guild, amount, announce_channel=None):
     save_json(LEVELS_FILE, levels_data)
 
 
+ACTIVE_WINDOW_DEFAULT_DAYS = 7   # "weekly" by default — how many days count as "recent" for the active roles/leaderboards
+ACTIVE_ROLE_MIN_MESSAGES = 15    # need at least this many messages in the window to hold the chat-active role
+ACTIVE_ROLE_MIN_VOICE_MINUTES = 20  # need at least this many voice minutes in the window to hold the voice-active role
+ACTIVE_ROLE_MIN_OVERALL_SCORE = min(ACTIVE_ROLE_MIN_MESSAGES * XP_PER_MESSAGE, ACTIVE_ROLE_MIN_VOICE_MINUTES * DEFAULT_VOICE_XP_PER_MINUTE)  # combined chat+voice score needed for the overall-active role
+ACTIVITY_RETENTION_DAYS = 60     # daily buckets older than this get pruned regardless of window, to keep the file small
+
+
+def _today_key() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
 def record_chat_activity(guild_id: int, user_id: int):
     guild_activity = activity_data.setdefault(str(guild_id), {})
-    user_activity = guild_activity.setdefault(str(user_id), {"messages": 0, "voice_seconds": 0})
-    user_activity["messages"] = user_activity.get("messages", 0) + 1
+    user_activity = guild_activity.setdefault(str(user_id), {"daily": {}})
+    day = user_activity.setdefault("daily", {}).setdefault(_today_key(), {"messages": 0, "voice_seconds": 0})
+    day["messages"] = day.get("messages", 0) + 1
     save_json(ACTIVITY_FILE, activity_data)
 
 
@@ -2175,9 +2370,69 @@ def record_voice_activity(guild_id: int, user_id: int, seconds: float):
     if seconds <= 0:
         return
     guild_activity = activity_data.setdefault(str(guild_id), {})
-    user_activity = guild_activity.setdefault(str(user_id), {"messages": 0, "voice_seconds": 0})
-    user_activity["voice_seconds"] = user_activity.get("voice_seconds", 0) + seconds
+    user_activity = guild_activity.setdefault(str(user_id), {"daily": {}})
+    day = user_activity.setdefault("daily", {}).setdefault(_today_key(), {"messages": 0, "voice_seconds": 0})
+    day["voice_seconds"] = day.get("voice_seconds", 0) + seconds
     save_json(ACTIVITY_FILE, activity_data)
+
+
+def get_recent_activity(guild_id, window_days: int):
+    """Returns {user_id_str: {'messages': int, 'voice_seconds': float}} summed over just the
+    last window_days — this is what makes 'most active' mean CURRENTLY/genuinely active,
+    rather than whoever racked up the biggest all-time total once and went quiet."""
+    cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=window_days)).strftime("%Y-%m-%d")
+    result = {}
+    for user_id_str, user_activity in activity_data.get(str(guild_id), {}).items():
+        messages = 0
+        voice_seconds = 0
+        for day_key, day_data in user_activity.get("daily", {}).items():
+            if day_key >= cutoff:
+                messages += day_data.get("messages", 0)
+                voice_seconds += day_data.get("voice_seconds", 0)
+        if messages or voice_seconds:
+            result[user_id_str] = {"messages": messages, "voice_seconds": voice_seconds}
+    return result
+
+
+def get_overall_activity_score(guild_id, recent: dict) -> dict:
+    """Combines chat + voice into ONE 'overall activity' score per user, using THIS server's
+    own configured chat-XP-per-message and voice-XP-per-minute as the weighting — so 'overall
+    active' naturally reflects however this server already values chat vs voice engagement,
+    rather than an arbitrary made-up ratio. Returns {user_id_str: combined_score}."""
+    settings = guild_settings.get(str(guild_id), {})
+    xp_per_message = settings.get("xp_per_message", XP_PER_MESSAGE)
+    xp_per_voice_minute = settings.get("voice_xp_per_minute", DEFAULT_VOICE_XP_PER_MINUTE)
+    return {
+        uid: data.get("messages", 0) * xp_per_message + (data.get("voice_seconds", 0) / 60) * xp_per_voice_minute
+        for uid, data in recent.items()
+    }
+
+
+def get_messages_for_day(guild_id, day_key: str) -> dict:
+    """Returns {user_id_str: messages} for just ONE specific day — used by the daily
+    'Certified Yapper' role, which resets fresh every day."""
+    result = {}
+    for user_id_str, user_activity in activity_data.get(str(guild_id), {}).items():
+        day_data = user_activity.get("daily", {}).get(day_key)
+        if day_data and day_data.get("messages", 0) > 0:
+            result[user_id_str] = day_data["messages"]
+    return result
+
+
+def prune_old_activity():
+    """Drops daily activity buckets older than ACTIVITY_RETENTION_DAYS so the file doesn't
+    grow forever — run periodically, not on every message."""
+    cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=ACTIVITY_RETENTION_DAYS)).strftime("%Y-%m-%d")
+    changed = False
+    for guild_activity in activity_data.values():
+        for user_activity in guild_activity.values():
+            daily = user_activity.get("daily", {})
+            for day_key in list(daily.keys()):
+                if day_key < cutoff:
+                    del daily[day_key]
+                    changed = True
+    if changed:
+        save_json(ACTIVITY_FILE, activity_data)
 
 
 async def add_xp(message):
