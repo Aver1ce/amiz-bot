@@ -156,6 +156,7 @@ GIVEAWAYS_FILE = os.path.join(BASE_DIR, "giveaways.json")
 STARBOARD_FILE = os.path.join(BASE_DIR, "starboard.json")
 INVITES_FILE = os.path.join(BASE_DIR, "invites.json")
 GLOBAL_BANS_FILE = os.path.join(BASE_DIR, "global_bans.json")
+ACTIVITY_FILE = os.path.join(BASE_DIR, "activity.json")
 
 
 def load_json(path):
@@ -198,6 +199,10 @@ invite_data = load_json(INVITES_FILE)
 # global_bans.json format: {"user_id": {"reason", "banned_by", "timestamp"}} — anyone here
 # gets banned from every server the bot is in, and auto-banned in any server it joins later
 global_bans_data = load_json(GLOBAL_BANS_FILE)
+# activity.json format: {"guild_id": {"user_id": {"messages": int, "voice_seconds": float}}} —
+# raw activity counts, tracked separately from XP/levels so it still works even if a server
+# has leveling turned off. Used for chat/voice leaderboards and the "most active" roles.
+activity_data = load_json(ACTIVITY_FILE)
 guild_invite_cache = {}  # runtime only: guild_id -> {invite_code: uses} snapshot, used to spot
                           # which invite's use-count went up when someone joins
 
@@ -349,6 +354,8 @@ async def setup_hook():
         giveaway_check.start()
     if not auto_data_backup.is_running():
         auto_data_backup.start()
+    if not server_stats_and_active_roles_update.is_running():
+        server_stats_and_active_roles_update.start()
 
 
 async def cache_guild_invites(guild: discord.Guild):
@@ -426,7 +433,10 @@ HELP_CATEGORIES = {
             "`setlevelupchannel` `setbirthdaychannel` `setstarboardchannel` `setstarboardthreshold`\n"
             "`setannouncementchannel` `setxpamount` `setvoicexpamount` `togglelevels`\n"
             "`setlevelrole` `removelevelrole` `listlevelroles` `addbannedword` `removebannedword`\n"
-            "`bannedwords` `showsettings`"
+            "`bannedwords` `showsettings`\n"
+            "`setmemberrole` `setbotrole` — auto-role new humans/bots on join\n"
+            "`setupserverstats` `removeserverstats` — live member/human/bot count channels\n"
+            "`setactivechatrole` `setactivevoicerole` — auto-role for the #1 most active member"
         ),
     },
     "moderation": {
@@ -440,10 +450,11 @@ HELP_CATEGORIES = {
     },
     "leveling": {
         "label": "📈 Leveling & Roles",
-        "title": "📈 Leveling, Reaction & Role Menus",
-        "description": "XP progress, level-up role rewards, and self-role menus.",
+        "title": "📈 Leveling, Activity & Role Menus",
+        "description": "XP progress, level-up role rewards, activity leaderboards, and self-role menus.",
         "commands": (
             "`rank` `leaderboard` `globalleaderboard` `setlevel` `addxp`\n"
+            "`chatleaderboard` `vcleaderboard` — most active members, by messages/voice time\n"
             "`rolemenu` — button-based self-roles (recommended!)\n"
             "`reactionrole` `createreactionrole` `removereactionrole` — older, reaction-based"
         ),
@@ -667,6 +678,17 @@ async def on_member_join(member):
         except discord.Forbidden:
             await dm_owner(f"⚠️ {member} is globally banned but I couldn't auto-ban them in **{member.guild.name}** — missing permission.")
         return  # don't welcome/track invites for someone who was just banned
+
+    # Auto-role: a different role for humans vs bots, set with !setmemberrole / !setbotrole
+    settings = guild_settings.get(str(member.guild.id), {})
+    auto_role_id = settings.get("auto_bot_role") if member.bot else settings.get("auto_member_role")
+    if auto_role_id:
+        auto_role = member.guild.get_role(auto_role_id)
+        if auto_role:
+            try:
+                await member.add_roles(auto_role, reason="Auto-role on join")
+            except discord.Forbidden:
+                await dm_owner(f"⚠️ Tried to auto-give {member} the '{auto_role.name}' role in {member.guild.name} but don't have permission.")
 
     channel = get_guild_channel(member.guild.id, "welcome_channel")
     if channel:
@@ -1038,6 +1060,42 @@ async def setwelcomechannel(ctx, channel: discord.TextChannel):
 @bot.hybrid_command()
 @commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(role="Role to auto-give every new HUMAN member (leave blank to turn this off)")
+async def setmemberrole(ctx, role: discord.Role = None):
+    """Auto-gives a role to every human who joins THIS server. Usage: !setmemberrole @Member
+    (run with no role to turn it off)."""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    if role is None:
+        settings.pop("auto_member_role", None)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description="🛑 Turned off auto-role for new members.", color=discord.Color.orange()))
+        return
+    settings["auto_member_role"] = role.id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"✅ New human members will now automatically get {role.mention}.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(role="Role to auto-give every new BOT added to the server (leave blank to turn this off)")
+async def setbotrole(ctx, role: discord.Role = None):
+    """Auto-gives a role to every bot added to THIS server. Usage: !setbotrole @Bots
+    (run with no role to turn it off)."""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    if role is None:
+        settings.pop("auto_bot_role", None)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description="🛑 Turned off auto-role for new bots.", color=discord.Color.orange()))
+        return
+    settings["auto_bot_role"] = role.id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"✅ New bots will now automatically get {role.mention}.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
 async def setannouncementchannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's channel for bot-wide announcements — right now that's the
     bot-creator's !broadcast messages, and the one-time setup guide posted when the bot
@@ -1242,6 +1300,209 @@ async def listlevelroles(ctx):
         role = ctx.guild.get_role(role_id)
         lines.append(f"**Level {level_str}** → {role.mention if role else '`(deleted role)`'}")
     await ctx.send(embed=discord.Embed(title="🏅 Level-Up Roles", description="\n".join(lines), color=discord.Color.gold()))
+
+
+# ============================================================
+# SERVER STATS CHANNELS — creates locked voice channels (like the "ServerStats" bot) whose
+# NAMES show live counts. Nobody can actually join them; they're just for display. Names
+# only refresh every ~10 minutes (Discord rate-limits channel renames hard — roughly 2 per
+# 10 minutes per channel — so anything faster would just get throttled/dropped anyway).
+# ============================================================
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+async def setupserverstats(ctx):
+    """Creates a locked category with 3 voice channels showing live member/human/bot counts
+    (names only, like the ServerStats bot) — refreshes automatically every ~10 minutes.
+    Usage: !setupserverstats"""
+    guild = ctx.guild
+    overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False)}
+    try:
+        category = await guild.create_category("📊 Server Stats", overwrites=overwrites, reason="Server stats setup")
+        members_channel = await guild.create_voice_channel("👥 Members: ...", category=category, reason="Server stats setup")
+        humans_channel = await guild.create_voice_channel("🧍 Humans: ...", category=category, reason="Server stats setup")
+        bots_channel = await guild.create_voice_channel("🤖 Bots: ...", category=category, reason="Server stats setup")
+    except discord.Forbidden:
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — NO_PERMISSION", description="I need Manage Channels permission to create these.", color=discord.Color.red()))
+        return
+
+    settings = guild_settings.setdefault(str(guild.id), {})
+    settings["stats_channels"] = {
+        "category": category.id, "members": members_channel.id,
+        "humans": humans_channel.id, "bots": bots_channel.id,
+    }
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await update_server_stats_for_guild(guild)
+    await ctx.send(embed=discord.Embed(description="✅ Server stats channels created — they'll refresh automatically roughly every 10 minutes.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+async def removeserverstats(ctx):
+    """Deletes the server stats category/channels created with !setupserverstats."""
+    settings = guild_settings.get(str(ctx.guild.id), {})
+    stats = settings.pop("stats_channels", None)
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    if not stats:
+        await ctx.send(embed=discord.Embed(description="No server stats channels are set up here.", color=discord.Color.greyple()))
+        return
+    for key in ("members", "humans", "bots", "category"):
+        channel = ctx.guild.get_channel(stats.get(key))
+        if channel:
+            try:
+                await channel.delete(reason="Server stats removed")
+            except discord.HTTPException:
+                pass
+    await ctx.send(embed=discord.Embed(description="🗑️ Removed the server stats channels.", color=discord.Color.orange()))
+
+
+async def update_server_stats_for_guild(guild: discord.Guild):
+    stats = guild_settings.get(str(guild.id), {}).get("stats_channels")
+    if not stats:
+        return
+    total = guild.member_count
+    bots = sum(1 for m in guild.members if m.bot)
+    humans = total - bots
+
+    for key, label, count in (("members", "👥 Members", total), ("humans", "🧍 Humans", humans), ("bots", "🤖 Bots", bots)):
+        channel = guild.get_channel(stats.get(key))
+        if channel is None:
+            continue
+        new_name = f"{label}: {count}"
+        if channel.name != new_name:  # only rename when the count actually changed
+            try:
+                await channel.edit(name=new_name)
+            except discord.HTTPException:
+                pass  # likely rate-limited — it'll catch up next cycle
+
+
+# ============================================================
+# ACTIVITY LEADERBOARDS & "MOST ACTIVE" ROLES — tracks raw chat/voice activity (separate
+# from XP/levels, so it keeps working even with leveling turned off) and can auto-give a
+# role to whoever's currently #1 in chat and #1 in voice, per server. Only one person holds
+# each role at a time — it moves the moment someone else takes the top spot.
+# ============================================================
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(role="Role to give whoever is currently #1 for messages sent (leave blank to turn off)")
+async def setactivechatrole(ctx, role: discord.Role = None):
+    """Auto-gives a role to whoever is CURRENTLY the most active chatter in THIS server —
+    moves to someone else the moment they take the top spot. Usage: !setactivechatrole @Top Chatter"""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    if role is None:
+        settings.pop("active_chat_role", None)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description="🛑 Turned off the most-active-chatter role.", color=discord.Color.orange()))
+        return
+    settings["active_chat_role"] = role.id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await sync_active_roles(ctx.guild)
+    await ctx.send(embed=discord.Embed(description=f"✅ {role.mention} will now follow whoever's #1 in chat activity — updates roughly every 10 minutes.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(role="Role to give whoever is currently #1 for voice time (leave blank to turn off)")
+async def setactivevoicerole(ctx, role: discord.Role = None):
+    """Auto-gives a role to whoever is CURRENTLY the most active in voice in THIS server —
+    moves to someone else the moment they take the top spot. Usage: !setactivevoicerole @Top Voice"""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    if role is None:
+        settings.pop("active_voice_role", None)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description="🛑 Turned off the most-active-in-voice role.", color=discord.Color.orange()))
+        return
+    settings["active_voice_role"] = role.id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await sync_active_roles(ctx.guild)
+    await ctx.send(embed=discord.Embed(description=f"✅ {role.mention} will now follow whoever's #1 in voice activity — updates roughly every 10 minutes.", color=discord.Color.green()))
+
+
+async def sync_active_roles(guild: discord.Guild):
+    """Makes sure the configured 'most active' roles (chat/voice) are held by ONLY whoever
+    is currently #1 in each — takes it back from a previous holder who's no longer on top."""
+    settings = guild_settings.get(str(guild.id), {})
+    guild_activity = activity_data.get(str(guild.id), {})
+    if not guild_activity:
+        return
+
+    for setting_key, metric in (("active_chat_role", "messages"), ("active_voice_role", "voice_seconds")):
+        role_id = settings.get(setting_key)
+        if not role_id:
+            continue
+        role = guild.get_role(role_id)
+        if role is None:
+            continue
+
+        ranked = sorted(guild_activity.items(), key=lambda kv: kv[1].get(metric, 0), reverse=True)
+        top_user_id = int(ranked[0][0]) if ranked and ranked[0][1].get(metric, 0) > 0 else None
+        top_member = guild.get_member(top_user_id) if top_user_id else None
+
+        for member in role.members:
+            if member != top_member:
+                try:
+                    await member.remove_roles(role, reason="No longer the most active member")
+                except discord.Forbidden:
+                    pass
+        if top_member and role not in top_member.roles:
+            try:
+                await top_member.add_roles(role, reason="Currently the most active member")
+            except discord.Forbidden:
+                pass
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def chatleaderboard(ctx):
+    """Shows THIS server's top 10 most active members by messages sent."""
+    guild_activity = activity_data.get(str(ctx.guild.id), {})
+    ranked = sorted(guild_activity.items(), key=lambda kv: kv[1].get("messages", 0), reverse=True)
+    ranked = [(uid, data) for uid, data in ranked if data.get("messages", 0) > 0][:10]
+    if not ranked:
+        await ctx.send(embed=discord.Embed(description="No chat activity tracked yet.", color=discord.Color.greyple()))
+        return
+    lines = []
+    for i, (user_id_str, data) in enumerate(ranked, start=1):
+        member = ctx.guild.get_member(int(user_id_str))
+        label = member.mention if member else f"<@{user_id_str}> (left server)"
+        lines.append(f"**{i}.** {label} — {data.get('messages', 0)} message(s)")
+    await ctx.send(embed=discord.Embed(title=f"💬 Most Active — {ctx.guild.name}", description="\n".join(lines), color=discord.Color.blurple()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def vcleaderboard(ctx):
+    """Shows THIS server's top 10 most active members by time spent in voice."""
+    guild_activity = activity_data.get(str(ctx.guild.id), {})
+    ranked = sorted(guild_activity.items(), key=lambda kv: kv[1].get("voice_seconds", 0), reverse=True)
+    ranked = [(uid, data) for uid, data in ranked if data.get("voice_seconds", 0) > 0][:10]
+    if not ranked:
+        await ctx.send(embed=discord.Embed(description="No voice activity tracked yet.", color=discord.Color.greyple()))
+        return
+    lines = []
+    for i, (user_id_str, data) in enumerate(ranked, start=1):
+        member = ctx.guild.get_member(int(user_id_str))
+        label = member.mention if member else f"<@{user_id_str}> (left server)"
+        hours, remainder = divmod(int(data.get("voice_seconds", 0)), 3600)
+        minutes = remainder // 60
+        duration = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+        lines.append(f"**{i}.** {label} — {duration}")
+    await ctx.send(embed=discord.Embed(title=f"🎙️ Most Active (Voice) — {ctx.guild.name}", description="\n".join(lines), color=discord.Color.blurple()))
+
+
+@tasks.loop(minutes=10)
+async def server_stats_and_active_roles_update():
+    """Every 10 minutes: refreshes any server-stats channel names, and re-checks the
+    most-active-chat/voice roles in every server that has them configured."""
+    for guild in bot.guilds:
+        try:
+            await update_server_stats_for_guild(guild)
+            await sync_active_roles(guild)
+        except Exception as e:
+            print(f"⚠️ server_stats_and_active_roles_update failed for {guild.name}: {e}")
 
 
 @bot.hybrid_command()
@@ -1903,8 +2164,25 @@ async def grant_xp(member, guild, amount, announce_channel=None):
     save_json(LEVELS_FILE, levels_data)
 
 
+def record_chat_activity(guild_id: int, user_id: int):
+    guild_activity = activity_data.setdefault(str(guild_id), {})
+    user_activity = guild_activity.setdefault(str(user_id), {"messages": 0, "voice_seconds": 0})
+    user_activity["messages"] = user_activity.get("messages", 0) + 1
+    save_json(ACTIVITY_FILE, activity_data)
+
+
+def record_voice_activity(guild_id: int, user_id: int, seconds: float):
+    if seconds <= 0:
+        return
+    guild_activity = activity_data.setdefault(str(guild_id), {})
+    user_activity = guild_activity.setdefault(str(user_id), {"messages": 0, "voice_seconds": 0})
+    user_activity["voice_seconds"] = user_activity.get("voice_seconds", 0) + seconds
+    save_json(ACTIVITY_FILE, activity_data)
+
+
 async def add_xp(message):
     guild_id = str(message.guild.id)
+    record_chat_activity(message.guild.id, message.author.id)
     if not guild_settings.get(guild_id, {}).get("leveling_enabled", True):
         return
     user_id = str(message.author.id)
@@ -1930,6 +2208,8 @@ VOICE_XP_CHECK_INTERVAL_MINUTES = 5
 
 
 async def award_voice_xp(guild, member, minutes_elapsed):
+    if minutes_elapsed > 0:
+        record_voice_activity(guild.id, member.id, minutes_elapsed * 60)
     if not guild_settings.get(str(guild.id), {}).get("leveling_enabled", True):
         return
     rate = guild_settings.get(str(guild.id), {}).get("voice_xp_per_minute", DEFAULT_VOICE_XP_PER_MINUTE)
@@ -3244,7 +3524,7 @@ async def listbackups(ctx):
 # ============================================================
 DATA_FILES_FOR_EXPORT = [
     ROLES_FILE, LEVELS_FILE, REACTION_ROLES_FILE, AFK_FILE,
-    GUILD_SETTINGS_FILE, BIRTHDAYS_FILE, GIVEAWAYS_FILE, STARBOARD_FILE, INVITES_FILE, GLOBAL_BANS_FILE,
+    GUILD_SETTINGS_FILE, BIRTHDAYS_FILE, GIVEAWAYS_FILE, STARBOARD_FILE, INVITES_FILE, GLOBAL_BANS_FILE, ACTIVITY_FILE,
 ]
 
 
@@ -3281,6 +3561,7 @@ def reload_all_data():
     refresh(starboard_data, STARBOARD_FILE)
     refresh(invite_data, INVITES_FILE)
     refresh(global_bans_data, GLOBAL_BANS_FILE)
+    refresh(activity_data, ACTIVITY_FILE)
 
 
 @bot.hybrid_command()
