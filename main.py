@@ -458,7 +458,7 @@ HELP_CATEGORIES = {
         "description": "XP progress, level-up role rewards, activity leaderboards, and self-role menus.",
         "commands": (
             "`rank` `leaderboard` `globalleaderboard` `setlevel` `addxp`\n"
-            "`chatleaderboard` `vcleaderboard` `overallleaderboard` — most active members, by messages/voice/combined\n"
+            "`activeleaderboard` — chat/voice, today/weekly/all-time (dropdown to switch)\n"
             "`rolemenu` — button-based self-roles (recommended!)\n"
             "`reactionrole` `createreactionrole` `removereactionrole` — older, reaction-based"
         ),
@@ -1587,91 +1587,105 @@ async def sync_yapper_roles(guild: discord.Guild):
 @has_permissions_or_owner(manage_guild=True)
 @discord.app_commands.describe(days="How many days of activity count as 'recent' for the active roles and leaderboards")
 async def setactivitywindow(ctx, days: int):
-    """Sets how many days of RECENT activity count toward the most-active roles and the
-    leaderboards, in THIS server (default 14). A smaller window rewards who's active right
-    now; a bigger one smooths out day-to-day swings. Usage: !setactivitywindow 14"""
+    """Sets how many days of RECENT activity count toward the 'Top Active Weekly' / 'Top
+    Voice Active Weekly' / overall-active GROUP roles in THIS server (default 7 — weekly).
+    Doesn't affect !activeleaderboard, which always shows today/this-week/all-time
+    regardless of this setting. Usage: !setactivitywindow 7"""
     if days < 1 or days > ACTIVITY_RETENTION_DAYS:
         await ctx.send(embed=discord.Embed(description=f"Pick something between 1 and {ACTIVITY_RETENTION_DAYS} days.", color=discord.Color.red()))
         return
     guild_settings.setdefault(str(ctx.guild.id), {})["active_window_days"] = days
     save_json(GUILD_SETTINGS_FILE, guild_settings)
     await sync_active_roles(ctx.guild)
-    await ctx.send(embed=discord.Embed(description=f"✅ Activity roles and leaderboards now look at the last **{days} day(s)**.", color=discord.Color.green()))
+    await ctx.send(embed=discord.Embed(description=f"✅ The active-chatters/active-voice/active-overall roles now look at the last **{days} day(s)**.", color=discord.Color.green()))
 
 
-@bot.hybrid_command()
-@commands.guild_only()
-async def chatleaderboard(ctx):
-    """Shows THIS server's top 10 most active members by messages sent, over the recent
-    activity window (default last 14 days — see !setactivitywindow)."""
-    window_days = guild_settings.get(str(ctx.guild.id), {}).get("active_window_days", ACTIVE_WINDOW_DEFAULT_DAYS)
-    recent = get_recent_activity(ctx.guild.id, window_days)
-    ranked = sorted(recent.items(), key=lambda kv: kv[1].get("messages", 0), reverse=True)
-    ranked = [(uid, data) for uid, data in ranked if data.get("messages", 0) > 0][:10]
-    if not ranked:
-        await ctx.send(embed=discord.Embed(description="No chat activity tracked in the recent window yet.", color=discord.Color.greyple()))
-        return
-    lines = []
-    for i, (user_id_str, data) in enumerate(ranked, start=1):
-        member = ctx.guild.get_member(int(user_id_str))
-        label = member.mention if member else f"<@{user_id_str}> (left server)"
-        lines.append(f"**{i}.** {label} — {data.get('messages', 0)} message(s)")
-    embed = discord.Embed(title=f"💬 Most Active — {ctx.guild.name}", description="\n".join(lines), color=discord.Color.blurple())
-    embed.set_footer(text=f"Last {window_days} day(s) — not an all-time total")
-    await ctx.send(embed=embed)
+ACTIVITY_LEADERBOARD_SCOPES = [
+    ("chat_today", "💬", "Chat — Today"),
+    ("chat_weekly", "💬", "Chat — Weekly"),
+    ("chat_alltime", "💬", "Chat — All Time"),
+    ("vc_today", "🎙️", "Voice — Today"),
+    ("vc_weekly", "🎙️", "Voice — Weekly"),
+    ("vc_alltime", "🎙️", "Voice — All Time"),
+]
+ACTIVITY_SCOPE_LABELS = {key: f"{emoji} {label}" for key, emoji, label in ACTIVITY_LEADERBOARD_SCOPES}
 
 
-@bot.hybrid_command()
-@commands.guild_only()
-async def vcleaderboard(ctx):
-    """Shows THIS server's top 10 most active members by time spent in voice, over the
-    recent activity window (default last 14 days — see !setactivitywindow)."""
-    window_days = guild_settings.get(str(ctx.guild.id), {}).get("active_window_days", ACTIVE_WINDOW_DEFAULT_DAYS)
-    recent = get_recent_activity(ctx.guild.id, window_days)
-    ranked = sorted(recent.items(), key=lambda kv: kv[1].get("voice_seconds", 0), reverse=True)
-    ranked = [(uid, data) for uid, data in ranked if data.get("voice_seconds", 0) > 0][:10]
-    if not ranked:
-        await ctx.send(embed=discord.Embed(description="No voice activity tracked in the recent window yet.", color=discord.Color.greyple()))
-        return
-    lines = []
-    for i, (user_id_str, data) in enumerate(ranked, start=1):
-        member = ctx.guild.get_member(int(user_id_str))
-        label = member.mention if member else f"<@{user_id_str}> (left server)"
-        hours, remainder = divmod(int(data.get("voice_seconds", 0)), 3600)
+def get_activity_scores_for_scope(guild_id, scope: str) -> dict:
+    """Returns {user_id_str: raw_count} for one leaderboard scope — messages for chat
+    scopes, voice_seconds for voice scopes."""
+    if scope == "chat_today":
+        return get_messages_for_day(guild_id, _today_key())
+    if scope == "vc_today":
+        return get_voice_seconds_for_day(guild_id, _today_key())
+    if scope == "chat_weekly":
+        recent = get_recent_activity(guild_id, 7)
+        return {uid: d.get("messages", 0) for uid, d in recent.items() if d.get("messages", 0) > 0}
+    if scope == "vc_weekly":
+        recent = get_recent_activity(guild_id, 7)
+        return {uid: d.get("voice_seconds", 0) for uid, d in recent.items() if d.get("voice_seconds", 0) > 0}
+    if scope == "chat_alltime":
+        return {uid: d.get("messages", 0) for uid, d in get_lifetime_activity(guild_id).items() if d.get("messages", 0) > 0}
+    if scope == "vc_alltime":
+        return {uid: d.get("voice_seconds", 0) for uid, d in get_lifetime_activity(guild_id).items() if d.get("voice_seconds", 0) > 0}
+    return {}
+
+
+def format_activity_value(scope: str, value) -> str:
+    if scope.startswith("vc_"):
+        hours, remainder = divmod(int(value), 3600)
         minutes = remainder // 60
-        duration = f"{hours}h {minutes}m" if hours else f"{minutes}m"
-        lines.append(f"**{i}.** {label} — {duration}")
-    embed = discord.Embed(title=f"🎙️ Most Active (Voice) — {ctx.guild.name}", description="\n".join(lines), color=discord.Color.blurple())
-    embed.set_footer(text=f"Last {window_days} day(s) — not an all-time total")
-    await ctx.send(embed=embed)
+        return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+    return f"{int(value)} msg"
+
+
+def build_activity_leaderboard_embed(guild: discord.Guild, scope: str) -> discord.Embed:
+    """Same visual style as the levels leaderboard — author line with the server icon, one
+    field per rank, footer with the scope."""
+    scores = get_activity_scores_for_scope(guild.id, scope)
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:10]
+
+    embed = discord.Embed(color=discord.Color.dark_teal())
+    embed.set_author(name=f"{guild.name}'s activity leaderboard", icon_url=(guild.icon.url if guild.icon else bot.user.display_avatar.url))
+    embed.description = f"**{ACTIVITY_SCOPE_LABELS[scope]}**"
+
+    if not ranked:
+        embed.add_field(name="\u200b", value="No activity tracked for this yet.", inline=False)
+    else:
+        for i, (user_id_str, value) in enumerate(ranked, start=1):
+            embed.add_field(name="\u200b", value=f"**#{i}** • <@{user_id_str}> • {format_activity_value(scope, value)}", inline=False)
+
+    embed.set_footer(text=f"Top {len(ranked)} member(s) — this server only")
+    return embed
+
+
+class ActivityLeaderboardSelect(discord.ui.Select):
+    def __init__(self, guild: discord.Guild, current_scope: str):
+        options = [
+            discord.SelectOption(label=label, value=key, emoji=emoji, default=(key == current_scope))
+            for key, emoji, label in ACTIVITY_LEADERBOARD_SCOPES
+        ]
+        super().__init__(placeholder=ACTIVITY_SCOPE_LABELS[current_scope], options=options, min_values=1, max_values=1)
+        self.guild = guild
+
+    async def callback(self, interaction: discord.Interaction):
+        scope = self.values[0]
+        await interaction.response.edit_message(embed=build_activity_leaderboard_embed(self.guild, scope), view=ActivityLeaderboardView(self.guild, scope))
+
+
+class ActivityLeaderboardView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, current_scope: str, timeout: float = 180):
+        super().__init__(timeout=timeout)
+        self.add_item(ActivityLeaderboardSelect(guild, current_scope))
 
 
 @bot.hybrid_command()
 @commands.guild_only()
-async def overallleaderboard(ctx):
-    """Shows THIS server's top 10 most active members OVERALL — chat and voice combined
-    into one score, weighted using this server's XP-per-message/XP-per-voice-minute
-    settings, over the recent activity window (default last 14 days)."""
-    window_days = guild_settings.get(str(ctx.guild.id), {}).get("active_window_days", ACTIVE_WINDOW_DEFAULT_DAYS)
-    recent = get_recent_activity(ctx.guild.id, window_days)
-    scores = get_overall_activity_score(ctx.guild.id, recent)
-    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    ranked = [(uid, score) for uid, score in ranked if score > 0][:10]
-    if not ranked:
-        await ctx.send(embed=discord.Embed(description="No activity tracked in the recent window yet.", color=discord.Color.greyple()))
-        return
-    lines = []
-    for i, (user_id_str, score) in enumerate(ranked, start=1):
-        member = ctx.guild.get_member(int(user_id_str))
-        label = member.mention if member else f"<@{user_id_str}> (left server)"
-        data = recent.get(user_id_str, {})
-        hours, remainder = divmod(int(data.get("voice_seconds", 0)), 3600)
-        minutes = remainder // 60
-        voice_str = f"{hours}h {minutes}m" if hours else f"{minutes}m"
-        lines.append(f"**{i}.** {label} — {data.get('messages', 0)} msg, {voice_str} voice")
-    embed = discord.Embed(title=f"⭐ Most Active Overall — {ctx.guild.name}", description="\n".join(lines), color=discord.Color.gold())
-    embed.set_footer(text=f"Last {window_days} day(s), chat + voice combined — not an all-time total")
-    await ctx.send(embed=embed)
+@discord.app_commands.describe(scope="Which activity leaderboard to show (you can also switch with the dropdown after)")
+async def activeleaderboard(ctx, scope: typing.Literal["chat_today", "chat_weekly", "chat_alltime", "vc_today", "vc_weekly", "vc_alltime"] = "chat_weekly"):
+    """Shows THIS server's activity leaderboard — chat or voice, today/this week/all time.
+    Usage: !activeleaderboard chat_weekly (or switch scopes with the dropdown afterward)."""
+    await ctx.send(embed=build_activity_leaderboard_embed(ctx.guild, scope), view=ActivityLeaderboardView(ctx.guild, scope))
 
 
 @tasks.loop(minutes=10)
@@ -1832,6 +1846,20 @@ async def on_member_update(before, after):
     # changes, avatar changes, etc, and those don't affect the backup at all.
     if before.roles != after.roles:
         schedule_auto_backup(after.guild)
+
+    # If someone manually strips the "Timed Out" role off a member who's still actively
+    # serving a timeout (their pre-timeout roles are still stashed, meaning it hasn't
+    # expired/been lifted yet), automatically put it right back — and disconnect them from
+    # voice again in case that's how they got out of the isolation.
+    timeout_role = discord.utils.get(after.guild.roles, name=TIMEOUT_ROLE_NAME)
+    if timeout_role and timeout_role in before.roles and timeout_role not in after.roles:
+        if str(after.id) in stored_roles:
+            try:
+                await after.add_roles(timeout_role, reason="Timeout role removed manually — restored, timeout is still active")
+                if after.voice and after.voice.channel:
+                    await after.move_to(None, reason="Timed out (role was manually removed)")
+            except discord.Forbidden:
+                pass
 
 
 # ============================================================
@@ -2358,11 +2386,26 @@ def _today_key() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
+def _ensure_lifetime(user_activity: dict) -> dict:
+    """Backfills the 'lifetime' totals field for activity records created before it existed,
+    by summing whatever daily buckets are already there. Returns the lifetime dict — this
+    is what makes 'all time' actually mean all time, surviving daily-bucket pruning."""
+    if "lifetime" not in user_activity:
+        daily = user_activity.get("daily", {})
+        user_activity["lifetime"] = {
+            "messages": sum(d.get("messages", 0) for d in daily.values()),
+            "voice_seconds": sum(d.get("voice_seconds", 0) for d in daily.values()),
+        }
+    return user_activity["lifetime"]
+
+
 def record_chat_activity(guild_id: int, user_id: int):
     guild_activity = activity_data.setdefault(str(guild_id), {})
     user_activity = guild_activity.setdefault(str(user_id), {"daily": {}})
     day = user_activity.setdefault("daily", {}).setdefault(_today_key(), {"messages": 0, "voice_seconds": 0})
     day["messages"] = day.get("messages", 0) + 1
+    lifetime = _ensure_lifetime(user_activity)
+    lifetime["messages"] = lifetime.get("messages", 0) + 1
     save_json(ACTIVITY_FILE, activity_data)
 
 
@@ -2373,6 +2416,8 @@ def record_voice_activity(guild_id: int, user_id: int, seconds: float):
     user_activity = guild_activity.setdefault(str(user_id), {"daily": {}})
     day = user_activity.setdefault("daily", {}).setdefault(_today_key(), {"messages": 0, "voice_seconds": 0})
     day["voice_seconds"] = day.get("voice_seconds", 0) + seconds
+    lifetime = _ensure_lifetime(user_activity)
+    lifetime["voice_seconds"] = lifetime.get("voice_seconds", 0) + seconds
     save_json(ACTIVITY_FILE, activity_data)
 
 
@@ -2391,6 +2436,17 @@ def get_recent_activity(guild_id, window_days: int):
                 voice_seconds += day_data.get("voice_seconds", 0)
         if messages or voice_seconds:
             result[user_id_str] = {"messages": messages, "voice_seconds": voice_seconds}
+    return result
+
+
+def get_lifetime_activity(guild_id) -> dict:
+    """Returns {user_id_str: {'messages': int, 'voice_seconds': float}} — true all-time
+    totals, unaffected by daily-bucket pruning."""
+    result = {}
+    for user_id_str, user_activity in activity_data.get(str(guild_id), {}).items():
+        lifetime = _ensure_lifetime(user_activity)
+        if lifetime.get("messages") or lifetime.get("voice_seconds"):
+            result[user_id_str] = lifetime
     return result
 
 
@@ -2416,6 +2472,16 @@ def get_messages_for_day(guild_id, day_key: str) -> dict:
         day_data = user_activity.get("daily", {}).get(day_key)
         if day_data and day_data.get("messages", 0) > 0:
             result[user_id_str] = day_data["messages"]
+    return result
+
+
+def get_voice_seconds_for_day(guild_id, day_key: str) -> dict:
+    """Returns {user_id_str: voice_seconds} for just ONE specific day."""
+    result = {}
+    for user_id_str, user_activity in activity_data.get(str(guild_id), {}).items():
+        day_data = user_activity.get("daily", {}).get(day_key)
+        if day_data and day_data.get("voice_seconds", 0) > 0:
+            result[user_id_str] = day_data["voice_seconds"]
     return result
 
 
@@ -3068,12 +3134,23 @@ async def custom_timeout(member: discord.Member, guild: discord.Guild, minutes: 
                 pass
 
     current_role_ids = [role.id for role in member.roles if role != guild.default_role]
-    stored_roles[str(member.id)] = current_role_ids
+    stored_roles[str(member.id)] = {
+        "role_ids": current_role_ids,
+        "guild_id": guild.id,
+        "issued_by": moderator.id if moderator else bot.user.id,
+    }
     save_json(ROLES_FILE, stored_roles)
 
     roles_to_remove = [r for r in member.roles if r != guild.default_role]
     await member.remove_roles(*roles_to_remove, reason=reason)
     await member.add_roles(timeout_role, reason=reason)
+
+    # A text-channel timeout doesn't stop someone from talking in voice — disconnect them too.
+    if member.voice and member.voice.channel:
+        try:
+            await member.move_to(None, reason="Timed out")
+        except discord.Forbidden:
+            pass
 
     await mod_log(guild, "Member Timed Out", member, moderator or bot.user, f"{reason} ({minutes} min)", discord.Color.orange())
 
@@ -3090,13 +3167,14 @@ async def custom_timeout(member: discord.Member, guild: discord.Guild, minutes: 
 
 
 async def restore_roles(member: discord.Member, guild: discord.Guild):
-    saved_ids = stored_roles.get(str(member.id))
+    record = stored_roles.get(str(member.id))
     timeout_role = discord.utils.get(guild.roles, name=TIMEOUT_ROLE_NAME)
 
     if timeout_role and timeout_role in member.roles:
         await member.remove_roles(timeout_role, reason="Timeout expired")
 
-    if saved_ids:
+    if record:
+        saved_ids = record.get("role_ids", []) if isinstance(record, dict) else record  # tolerate the old plain-list format
         roles = [guild.get_role(rid) for rid in saved_ids if guild.get_role(rid)]
         if roles:
             await member.add_roles(*roles, reason="Timeout expired — restoring roles")
@@ -3121,6 +3199,12 @@ async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reaso
 @commands.guild_only()
 @has_permissions_or_owner(moderate_members=True)
 async def untimeout(ctx, member: discord.Member):
+    """Lifts an active timeout early. If the bot owner personally issued it, only the bot
+    owner can lift it early — a regular moderator can't override an owner-issued timeout."""
+    record = stored_roles.get(str(member.id))
+    if isinstance(record, dict) and record.get("issued_by") == OWNER_ID and ctx.author.id != OWNER_ID:
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — NOT_ALLOWED", description="This timeout was issued by the bot owner — only they can lift it early.", color=discord.Color.red()))
+        return
     await restore_roles(member, ctx.guild)
     await ctx.send(embed=discord.Embed(description=f"🔊 {member.mention}'s roles have been restored.", color=discord.Color.green()))
 
@@ -3850,6 +3934,31 @@ async def broadcast(ctx, *, message: str):
     if failed:
         summary.add_field(name="⚠️ Couldn't reach", value=", ".join(failed)[:1024], inline=False)
     await ctx.send(embed=summary)
+
+
+@bot.hybrid_command(name="arrowz")
+@commands.guild_only()
+@commands.cooldown(1, 60, commands.BucketType.user)
+@discord.app_commands.allowed_installs(guilds=True, users=False)
+@discord.app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@discord.app_commands.describe(message="What you want to say to Arrowz (the bot's creator)")
+async def arrowz(ctx, *, message: str):
+    """Sends a message directly to Arrowz (the bot's creator) — they'll see who sent it and
+    from which server/channel. Only works inside an actual server the bot is in — someone
+    who just has this bot installed as a personal app (not added to any server) can't use
+    this to message Arrowz out of nowhere. Usage: !arrowz Hey, love the bot! Could you add X?"""
+    embed = discord.Embed(title="📩 New message via !arrowz", description=message, color=discord.Color.blurple())
+    embed.add_field(name="From", value=f"{ctx.author} (`{ctx.author.id}`)", inline=False)
+    embed.add_field(name="Server", value=f"{ctx.guild.name} (`{ctx.guild.id}`)", inline=True)
+    embed.add_field(name="Channel", value=f"#{ctx.channel.name}", inline=True)
+    embed.set_footer(text="Sent via !arrowz")
+    try:
+        owner = await bot.fetch_user(OWNER_ID)
+        await owner.send(embed=embed)
+    except discord.Forbidden:
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — DM_CLOSED", description="Couldn't deliver your message right now — Arrowz's DMs might be closed. Try again later.", color=discord.Color.red()))
+        return
+    await ctx.send(embed=discord.Embed(description="✅ Sent! Arrowz will see your message.", color=discord.Color.green()))
 
 
 @bot.hybrid_command()
