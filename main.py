@@ -358,6 +358,10 @@ async def setup_hook():
         auto_data_backup.start()
     if not server_stats_and_active_roles_update.is_running():
         server_stats_and_active_roles_update.start()
+    if not timeout_expiry_check.is_running():
+        timeout_expiry_check.start()
+    if not voice_reconnect_check.is_running():
+        voice_reconnect_check.start()
 
 
 async def cache_guild_invites(guild: discord.Guild):
@@ -3138,6 +3142,7 @@ async def custom_timeout(member: discord.Member, guild: discord.Guild, minutes: 
         "role_ids": current_role_ids,
         "guild_id": guild.id,
         "issued_by": moderator.id if moderator else bot.user.id,
+        "expires_at": datetime.datetime.now(datetime.timezone.utc).timestamp() + minutes * 60,
     }
     save_json(ROLES_FILE, stored_roles)
 
@@ -3162,8 +3167,11 @@ async def custom_timeout(member: discord.Member, guild: discord.Guild, minutes: 
         )
         await timeout_channel.send(embed=embed)
 
-    await asyncio.sleep(minutes * 60)
-    await restore_roles(member, guild)
+    # No sleep here — timeout_expiry_check (a periodic task, like the giveaway system
+    # already does) restores them once expires_at passes. A sleep tied to this one command
+    # invocation would be silently lost forever if the bot restarted mid-timeout, leaving
+    # someone stuck in the Timed Out role permanently until someone noticed and manually
+    # ran !untimeout. Persisting the expiry means a restart just picks up where it left off.
 
 
 async def restore_roles(member: discord.Member, guild: discord.Guild):
@@ -3182,6 +3190,30 @@ async def restore_roles(member: discord.Member, guild: discord.Guild):
         save_json(ROLES_FILE, stored_roles)
 
     await mod_log(guild, "Timeout Expired — Roles Restored", member, bot.user, "Automatic", discord.Color.green())
+
+
+@tasks.loop(seconds=30)
+async def timeout_expiry_check():
+    """Restores anyone whose timeout has expired. Persisted via expires_at (checked here)
+    instead of an in-memory sleep tied to the original command call — so a bot restart
+    mid-timeout doesn't leave someone stuck in the Timed Out role forever."""
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    for user_id_str, record in list(stored_roles.items()):
+        if not isinstance(record, dict) or record.get("expires_at") is None:
+            continue  # tolerate old records from before this field existed — those need a manual !untimeout
+        if record["expires_at"] > now:
+            continue
+        guild = bot.get_guild(record.get("guild_id"))
+        if guild is None:
+            del stored_roles[user_id_str]
+            save_json(ROLES_FILE, stored_roles)
+            continue
+        member = guild.get_member(int(user_id_str))
+        if member is None:
+            del stored_roles[user_id_str]
+            save_json(ROLES_FILE, stored_roles)
+            continue
+        await restore_roles(member, guild)
 
 
 # ============================================================
@@ -3966,10 +3998,12 @@ async def arrowz(ctx, *, message: str):
 @owner_only()
 @discord.app_commands.describe(channel="Voice channel to join (leave blank to join whichever VC you're currently in)")
 async def joinvc(ctx, channel: discord.VoiceChannel = None):
-    """Bot-creator only. Joins a voice channel in THIS server and stays connected — e.g. to
-    keep a VC-activity streak/tracker going. Usage: !joinvc #general-voice, or just !joinvc
-    while you're sitting in a voice channel yourself. Needs PyNaCl installed (add it to
-    requirements.txt) — voice doesn't work without it.
+    """Bot-creator only. Joins a voice channel in THIS server and STAYS connected — if it
+    ever gets disconnected (network hiccup, a host restart, Discord booting bots left alone
+    in a channel, etc), it automatically rejoins within ~2 minutes, no need to re-run this.
+    Usage: !joinvc #general-voice, or just !joinvc while you're sitting in a voice channel
+    yourself. Needs PyNaCl installed (add it to requirements.txt) — voice doesn't work
+    without it.
     Heads up: this only helps if whatever tracks your 'streak' counts ANY member's presence
     in the channel — trackers that specifically check for YOUR account won't be fooled by
     the bot sitting in there instead of you."""
@@ -3996,14 +4030,21 @@ async def joinvc(ctx, channel: discord.VoiceChannel = None):
     except asyncio.TimeoutError:
         await ctx.send(embed=discord.Embed(title="⚠️ Error — VOICE_TIMEOUT", description="Timed out trying to connect to that voice channel.", color=discord.Color.red()))
         return
-    await ctx.send(embed=discord.Embed(description=f"🔊 Joined {channel.mention} and staying connected.", color=discord.Color.green()))
+
+    guild_settings.setdefault(str(ctx.guild.id), {})["persistent_vc_channel_id"] = channel.id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"🔊 Joined {channel.mention} and staying connected — will auto-rejoin if disconnected for any reason, until you run !leavevc.", color=discord.Color.green()))
 
 
 @bot.hybrid_command()
 @commands.guild_only()
 @owner_only()
 async def leavevc(ctx):
-    """Bot-creator only. Disconnects the bot from voice in THIS server. Usage: !leavevc"""
+    """Bot-creator only. Disconnects the bot from voice in THIS server, and stops the
+    auto-rejoin behavior from !joinvc. Usage: !leavevc"""
+    guild_settings.get(str(ctx.guild.id), {}).pop("persistent_vc_channel_id", None)
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+
     voice_client = ctx.guild.voice_client
     if voice_client is None or not voice_client.is_connected():
         await ctx.send(embed=discord.Embed(description="I'm not in a voice channel here.", color=discord.Color.greyple()))
@@ -4011,6 +4052,33 @@ async def leavevc(ctx):
     channel_name = voice_client.channel.name
     await voice_client.disconnect(force=True)
     await ctx.send(embed=discord.Embed(description=f"👋 Left `#{channel_name}`.", color=discord.Color.orange()))
+
+
+@tasks.loop(minutes=2)
+async def voice_reconnect_check():
+    """If !joinvc was used in a server, keeps the bot connected to that channel —
+    automatically reconnects if it ever gets disconnected (network drop, host restart,
+    Discord disconnecting a bot left alone in a channel, etc), instead of silently staying
+    disconnected until someone notices."""
+    for guild in bot.guilds:
+        channel_id = guild_settings.get(str(guild.id), {}).get("persistent_vc_channel_id")
+        if not channel_id:
+            continue
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            continue  # the channel itself got deleted — nothing to rejoin until !joinvc is re-run elsewhere
+
+        voice_client = guild.voice_client
+        if voice_client and voice_client.is_connected() and voice_client.channel and voice_client.channel.id == channel_id:
+            continue  # already exactly where it should be
+
+        try:
+            if voice_client and voice_client.is_connected():
+                await voice_client.move_to(channel)
+            else:
+                await channel.connect(reconnect=True)
+        except Exception as e:
+            print(f"⚠️ voice_reconnect_check failed for {guild.name}: {e}")
 
 
 # ============================================================
@@ -4067,10 +4135,10 @@ async def annirole(ctx, role: discord.Role):
     try:
         await role.delete(reason=f"Annihilated by bot owner ({ctx.author})")
     except discord.Forbidden:
-        guilds_in_bulk_delete.discard(ctx.guild.id)
         await ctx.send(embed=discord.Embed(title="⚠️ Error — NO_PERMISSION", description="I don't have permission to delete that role — it may be managed by an integration, or above my own role in the list.", color=discord.Color.red()))
         return
-    guilds_in_bulk_delete.discard(ctx.guild.id)
+    finally:
+        guilds_in_bulk_delete.discard(ctx.guild.id)  # always clear the flag, even on an unexpected error — otherwise this guild's mod-log DMs stay silently suppressed forever
     await ctx.send(embed=discord.Embed(description=f"💥 Deleted role `@{name}`.", color=discord.Color.dark_red()))
 
 
@@ -4087,10 +4155,10 @@ async def annichannel(ctx, channel: discord.abc.GuildChannel):
     try:
         await channel.delete(reason=f"Annihilated by bot owner ({ctx.author})")
     except discord.Forbidden:
-        guilds_in_bulk_delete.discard(ctx.guild.id)
         await ctx.send(embed=discord.Embed(title="⚠️ Error — NO_PERMISSION", description="I don't have permission to delete that channel.", color=discord.Color.red()))
         return
-    guilds_in_bulk_delete.discard(ctx.guild.id)
+    finally:
+        guilds_in_bulk_delete.discard(ctx.guild.id)
 
     summary = discord.Embed(description=f"💥 Deleted channel `#{name}`.", color=discord.Color.dark_red())
     if was_this_channel:
@@ -4111,19 +4179,20 @@ async def annicategory(ctx, category: discord.CategoryChannel):
 
     guilds_in_bulk_delete.add(ctx.guild.id)
     deleted = 0
-    for ch in channels:
-        try:
-            await ch.delete(reason=f"Annihilated by bot owner ({ctx.author}) — category wipe")
-            deleted += 1
-        except discord.HTTPException:
-            pass
     try:
-        await category.delete(reason=f"Annihilated by bot owner ({ctx.author})")
-    except discord.Forbidden:
+        for ch in channels:
+            try:
+                await ch.delete(reason=f"Annihilated by bot owner ({ctx.author}) — category wipe")
+                deleted += 1
+            except discord.HTTPException:
+                pass
+        try:
+            await category.delete(reason=f"Annihilated by bot owner ({ctx.author})")
+        except discord.Forbidden:
+            await ctx.send(embed=discord.Embed(title="⚠️ Error — NO_PERMISSION", description=f"Deleted {deleted}/{len(channels)} channel(s) inside, but couldn't delete the category itself.", color=discord.Color.red()))
+            return
+    finally:
         guilds_in_bulk_delete.discard(ctx.guild.id)
-        await ctx.send(embed=discord.Embed(title="⚠️ Error — NO_PERMISSION", description=f"Deleted {deleted}/{len(channels)} channel(s) inside, but couldn't delete the category itself.", color=discord.Color.red()))
-        return
-    guilds_in_bulk_delete.discard(ctx.guild.id)
 
     summary_text = f"💥 Deleted category `{category.name}` and {deleted} channel(s) inside it."
     if ran_inside_this_category:
@@ -4157,23 +4226,25 @@ async def anniserver(ctx):
 
     guilds_in_bulk_delete.add(guild.id)
     deleted_channels = 0
-    for channel in list(guild.channels):
-        try:
-            await channel.delete(reason=f"Server annihilated by bot owner ({ctx.author})")
-            deleted_channels += 1
-        except discord.HTTPException:
-            pass
-
     deleted_roles = 0
-    for role in list(guild.roles):
-        if role.is_default() or role.managed:
-            continue
-        try:
-            await role.delete(reason=f"Server annihilated by bot owner ({ctx.author})")
-            deleted_roles += 1
-        except discord.HTTPException:
-            pass
-    guilds_in_bulk_delete.discard(guild.id)
+    try:
+        for channel in list(guild.channels):
+            try:
+                await channel.delete(reason=f"Server annihilated by bot owner ({ctx.author})")
+                deleted_channels += 1
+            except discord.HTTPException:
+                pass
+
+        for role in list(guild.roles):
+            if role.is_default() or role.managed:
+                continue
+            try:
+                await role.delete(reason=f"Server annihilated by bot owner ({ctx.author})")
+                deleted_roles += 1
+            except discord.HTTPException:
+                pass
+    finally:
+        guilds_in_bulk_delete.discard(guild.id)
 
     # The channel this command ran in was very likely just deleted above, so report the
     # result over DM instead of trying (and probably failing) to send it back there.
