@@ -1645,7 +1645,9 @@ def format_activity_value(scope: str, value) -> str:
 
 def build_activity_leaderboard_embed(guild: discord.Guild, scope: str) -> discord.Embed:
     """Same visual style as the levels leaderboard — author line with the server icon, one
-    field per rank, footer with the scope."""
+    field per rank, footer with the scope. Discord embeds can only show ONE big image, so
+    everyone's avatar can't appear inline next to their own rank — the #1 member's avatar
+    is shown as the thumbnail instead, as the closest equivalent."""
     scores = get_activity_scores_for_scope(guild.id, scope)
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:10]
 
@@ -1658,6 +1660,9 @@ def build_activity_leaderboard_embed(guild: discord.Guild, scope: str) -> discor
     else:
         for i, (user_id_str, value) in enumerate(ranked, start=1):
             embed.add_field(name="\u200b", value=f"**#{i}** • <@{user_id_str}> • {format_activity_value(scope, value)}", inline=False)
+        top_member = guild.get_member(int(ranked[0][0]))
+        if top_member:
+            embed.set_thumbnail(url=top_member.display_avatar.url)
 
     embed.set_footer(text=f"Top {len(ranked)} member(s) — this server only")
     return embed
@@ -1678,8 +1683,8 @@ class ActivityLeaderboardSelect(discord.ui.Select):
 
 
 class ActivityLeaderboardView(discord.ui.View):
-    def __init__(self, guild: discord.Guild, current_scope: str, timeout: float = 180):
-        super().__init__(timeout=timeout)
+    def __init__(self, guild: discord.Guild, current_scope: str):
+        super().__init__(timeout=None)  # a finite timeout here caused "this interaction failed" — after the local timeout, discord.py stops tracking the view, so clicking the dropdown later gets no response at all and Discord shows a generic failure
         self.add_item(ActivityLeaderboardSelect(guild, current_scope))
 
 
@@ -2708,7 +2713,7 @@ class LeaderboardCategorySelect(discord.ui.Select):
 
 class LeaderboardView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=180)
+        super().__init__(timeout=None)  # same "this interaction failed" bug as ActivityLeaderboardView had — a finite timeout stops the dropdown from working after enough idle time
         self.add_item(LeaderboardCategorySelect())
 
 
@@ -2735,6 +2740,9 @@ async def leaderboard(ctx):
 
     for i, (user_id, data) in enumerate(sorted_users, start=1):
         embed.add_field(name="\u200b", value=f"**#{i}** • <@{user_id}> • LVL: {data['level']}", inline=False)
+    top_member = ctx.guild.get_member(int(sorted_users[0][0]))
+    if top_member:
+        embed.set_thumbnail(url=top_member.display_avatar.url)
 
     embed.set_footer(text=f"Top {len(sorted_users)} members by level — this server only")
     await ctx.send(embed=embed, view=LeaderboardView())
