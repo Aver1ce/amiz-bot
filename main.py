@@ -157,6 +157,7 @@ STARBOARD_FILE = os.path.join(BASE_DIR, "starboard.json")
 INVITES_FILE = os.path.join(BASE_DIR, "invites.json")
 GLOBAL_BANS_FILE = os.path.join(BASE_DIR, "global_bans.json")
 ACTIVITY_FILE = os.path.join(BASE_DIR, "activity.json")
+ROLE_MENUS_FILE = os.path.join(BASE_DIR, "role_menus.json")
 
 
 def load_json(path):
@@ -205,6 +206,10 @@ global_bans_data = load_json(GLOBAL_BANS_FILE)
 # someone could win once and hold forever. Tracked separately from XP/levels so it still
 # works even if a server has leveling turned off. Old buckets get pruned periodically.
 activity_data = load_json(ACTIVITY_FILE)
+# role_menus.json format: {"message_id": {"guild_id", "roles": [role_id,...],
+# "single_choice": bool, "removable": bool}} — only needed for menus using single_choice or
+# non-removable; a plain default-behavior menu's buttons are still fully self-contained.
+role_menus_data = load_json(ROLE_MENUS_FILE)
 guild_invite_cache = {}  # runtime only: guild_id -> {invite_code: uses} snapshot, used to spot
                           # which invite's use-count went up when someone joins
 
@@ -435,7 +440,7 @@ HELP_CATEGORIES = {
         "title": "⚙️ Setup Commands",
         "description": "Needs Manage Server permission, or the bot owner.",
         "commands": (
-            "`setwelcomechannel` `setgoodbyechannel` `setmodlogchannel` `settimeoutchannel`\n"
+            "`setwelcomechannel` `setgoodbyechannel` `setmodlogchannel` `settimeoutchannel` `settimeoutrole`\n"
             "`setlevelupchannel` `setbirthdaychannel` `setstarboardchannel` `setstarboardthreshold`\n"
             "`setannouncementchannel` `setxpamount` `setvoicexpamount` `togglelevels`\n"
             "`setlevelrole` `removelevelrole` `listlevelroles` `addbannedword` `removebannedword`\n"
@@ -473,7 +478,8 @@ HELP_CATEGORIES = {
         "description": "Just for fun.",
         "commands": (
             "`8ball` `coinflip` `roll` `rps` `joke`\n"
-            "`afk` `birthday` `setbirthday` `giveaway` `gend` `greroll`"
+            "`afk` `birthday` `setbirthday` `giveaway` `gend` `greroll` `giveawayentrants`\n"
+            "`togglegiveawayblacklist` `setgiveawaybonusrole` `setgiveawaybonusmember` `togglegiveawaydailyentries`"
         ),
     },
     "backups": {
@@ -862,17 +868,38 @@ async def on_interaction(interaction: discord.Interaction):
     custom_id = interaction.data.get("custom_id", "") if interaction.data else ""
 
     if custom_id.startswith("rolemenu:"):
-        role_id = int(custom_id.split(":", 1)[1])
+        parts = custom_id.split(":")
+        if len(parts) == 2:
+            # Old format from before menus had metadata: rolemenu:role_id — plain toggle,
+            # no single-choice/non-removable rules apply.
+            role_id = int(parts[1])
+            menu = None
+        else:
+            # New format: rolemenu:message_id:role_id
+            role_id = int(parts[2])
+            menu = role_menus_data.get(parts[1])
+
         role = interaction.guild.get_role(role_id) if interaction.guild else None
         if role is None:
             await interaction.response.send_message("That role doesn't exist anymore.", ephemeral=True)
             return
         member = interaction.user
+        single_choice = menu.get("single_choice", False) if menu else False
+        removable = menu.get("removable", True) if menu else True
+        menu_role_ids = set(menu.get("roles", [])) if menu else set()
+
         try:
             if role in member.roles:
+                if not removable:
+                    await interaction.response.send_message(f"You already have **{role.name}** — this menu doesn't allow removing roles once picked.", ephemeral=True)
+                    return
                 await member.remove_roles(role, reason="Role menu button")
                 await interaction.response.send_message(f"➖ Removed **{role.name}**.", ephemeral=True)
             else:
+                if single_choice:
+                    other_held = [r for r in member.roles if r.id in menu_role_ids and r.id != role_id]
+                    if other_held:
+                        await member.remove_roles(*other_held, reason="Role menu button (single-choice swap)")
                 await member.add_roles(role, reason="Role menu button")
                 await interaction.response.send_message(f"➕ Gave you **{role.name}**.", ephemeral=True)
         except discord.Forbidden:
@@ -884,13 +911,35 @@ async def on_interaction(interaction: discord.Interaction):
         if data is None:
             await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
             return
-        entrants = data.setdefault("entrants", [])
-        if interaction.user.id in entrants:
-            entrants.remove(interaction.user.id)
-            await interaction.response.send_message("➖ You left the giveaway.", ephemeral=True)
-        else:
-            entrants.append(interaction.user.id)
+
+        member = interaction.user
+        guild_id_str = str(interaction.guild.id) if interaction.guild else None
+        settings = guild_settings.get(guild_id_str, {}) if guild_id_str else {}
+        blacklist = set(settings.get("giveaway_blacklist_roles", []))
+        if any(r.id in blacklist for r in getattr(member, "roles", [])):
+            await interaction.response.send_message("🚫 You're not allowed to enter this giveaway.", ephemeral=True)
+            return
+
+        entrants = data.setdefault("entrants", {})
+        if isinstance(entrants, list):  # tolerate the old plain-list format from before entry counts existed
+            entrants = {str(uid): {"count": 1} for uid in entrants}
+            data["entrants"] = entrants
+
+        user_id_str = str(member.id)
+        today = _today_key()
+        record = entrants.get(user_id_str)
+        daily_entries_on = settings.get("giveaway_daily_entries", False)
+
+        if record is None:
+            entrants[user_id_str] = {"count": 1, "last_entry_day": today}
             await interaction.response.send_message("🎉 You're entered! Good luck!", ephemeral=True)
+        elif daily_entries_on and record.get("last_entry_day") != today:
+            record["count"] = record.get("count", 1) + 1
+            record["last_entry_day"] = today
+            await interaction.response.send_message(f"🎉 Extra entry added! You now have **{record['count']}** entries.", ephemeral=True)
+        else:
+            del entrants[user_id_str]
+            await interaction.response.send_message("➖ You left the giveaway.", ephemeral=True)
         save_json(GIVEAWAYS_FILE, giveaways_data)
 
 
@@ -1002,27 +1051,55 @@ async def createreactionrole(ctx, emoji: str, role: discord.Role, *, label: str 
     image="Optional image URL — shown as a big banner at the bottom of the menu",
     thumbnail="Optional image URL — shown as a small thumbnail in the top-right corner",
     color="Optional hex color for the embed's side bar, e.g. #5865F2",
+    single_choice="If true, picking a role removes any other role from THIS menu — only one at a time",
+    removable="If false, members can't remove a role once they've picked it from this menu (default true)",
 )
 async def rolemenu(ctx, title: str, role1: discord.Role, role2: discord.Role = None,
                     role3: discord.Role = None, role4: discord.Role = None, role5: discord.Role = None,
-                    description: str = None, image: str = None, thumbnail: str = None, color: str = None):
+                    description: str = None, image: str = None, thumbnail: str = None, color: str = None,
+                    single_choice: bool = False, removable: bool = True):
     """Posts a button-based self-role menu — click a button to get that role, click it again
-    to remove it. No reactions involved, and it keeps working after a bot restart (each
-    button carries its own role, so nothing needs to be re-registered on startup). Add an
-    image/thumbnail/color to make it match your server's vibe.
+    to remove it. No reactions involved, and it keeps working after a bot restart. Add an
+    image/thumbnail/color to make it match your server's vibe. Set single_choice=True for a
+    "pick only one" menu (choosing a new one swaps out the old), or removable=False so a
+    role can't be removed via this menu once picked.
     Usage: !rolemenu "Pick your pings" @VC @Announcements @Events @Giveaways
     Usable by anyone with Manage Roles (Administrators included) or the bot owner."""
     roles = [r for r in (role1, role2, role3, role4, role5) if r is not None]
     embed_color = parse_hex_color(color) or discord.Color.blurple()
-    embed = discord.Embed(title=title, description=description or "Click a button below to toggle a role.", color=embed_color)
+
+    description_text = description or "Click a button below to toggle a role."
+    if single_choice:
+        description_text += "\n*You can only hold one role from this menu at a time.*"
+    if not removable:
+        description_text += "\n*Roles picked here can't be removed through this menu.*"
+
+    embed = discord.Embed(title=title, description=description_text, color=embed_color)
     if image:
         embed.set_image(url=image)
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
+
     view = discord.ui.View(timeout=None)
     for role in roles:
-        view.add_item(discord.ui.Button(label=role.name[:80], style=discord.ButtonStyle.secondary, custom_id=f"rolemenu:{role.id}"))
-    await ctx.send(embed=embed, view=view)
+        view.add_item(discord.ui.Button(label=role.name[:80], style=discord.ButtonStyle.secondary, custom_id=f"rolemenu:pending:{role.id}"))
+    message = await ctx.send(embed=embed, view=view)
+
+    # Now that we have the real message ID, bake it into every button's custom_id, and
+    # persist the menu's metadata — needed so the single_choice/removable rules can be
+    # enforced (they require knowing every role in the menu, not just the one clicked).
+    for item in view.children:
+        role_id = item.custom_id.split(":")[2]
+        item.custom_id = f"rolemenu:{message.id}:{role_id}"
+    await message.edit(view=view)
+
+    role_menus_data[str(message.id)] = {
+        "guild_id": ctx.guild.id,
+        "roles": [r.id for r in roles],
+        "single_choice": single_choice,
+        "removable": removable,
+    }
+    save_json(ROLE_MENUS_FILE, role_menus_data)
 
 
 @bot.hybrid_command()
@@ -1139,7 +1216,33 @@ async def settimeoutchannel(ctx, channel: discord.TextChannel):
     """Sets THIS server's timeout channel (visible to timed-out members, they can't talk in it).
     Usage: !settimeoutchannel #timeout"""
     set_guild_channel(ctx.guild.id, "timeout_channel", channel.id)
+    timeout_role = get_timeout_role(ctx.guild)
+    if timeout_role:
+        # A timeout role already exists — without this, changing the timeout channel later
+        # wouldn't actually move the "visible but silent" exception to the new channel.
+        await setup_timeout_role_permissions(ctx.guild, timeout_role)
     await ctx.send(embed=discord.Embed(description=f"✅ Timed-out members will now only see {channel.mention}.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_roles=True)
+@discord.app_commands.describe(role="The role to use for timeouts (leave blank to go back to auto-creating/using a role named 'Timed Out')")
+async def settimeoutrole(ctx, role: discord.Role = None):
+    """Sets which role THIS server's timeout system uses, instead of the bot auto-creating
+    one called 'Timed Out'. Automatically (re)configures that role's channel permissions —
+    hidden everywhere except the timeout channel (if set with !settimeoutchannel), same as
+    the auto-created role would get. Usage: !settimeoutrole @Muted"""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    if role is None:
+        settings.pop("timeout_role_id", None)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description="🛑 Back to auto-creating/using a role named 'Timed Out'.", color=discord.Color.orange()))
+        return
+    settings["timeout_role_id"] = role.id
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await setup_timeout_role_permissions(ctx.guild, role)
+    await ctx.send(embed=discord.Embed(description=f"✅ Timeouts will now use {role.mention} — its channel permissions have been set up automatically.", color=discord.Color.green()))
 
 
 @bot.hybrid_command()
@@ -1437,13 +1540,13 @@ async def setactivevoicerole(ctx, role: discord.Role = None):
 @bot.hybrid_command()
 @commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
-@discord.app_commands.describe(role="Role to give EVERY member who's genuinely active overall this week — chat AND voice combined (leave blank to turn off)")
+@discord.app_commands.describe(role="Role to give EVERY member who's genuinely active in BOTH chat and voice this week (leave blank to turn off)")
 async def setactiveoverallrole(ctx, role: discord.Role = None):
-    """Auto-gives a role to EVERY member who clears an overall chat+voice activity bar this
-    week (weighted using this server's own XP-per-message and XP-per-voice-minute settings)
-    — everyone who qualifies gets it, not just #1. A different, separate role from
-    !setactivechatrole / !setactivevoicerole — someone great at both could hold all three.
-    Usage: !setactiveoverallrole @Active Overall"""
+    """Auto-gives a role to EVERY member who's genuinely active in BOTH chat AND voice this
+    week (has to clear the chat bar AND the voice bar — not just one or the other) —
+    everyone who qualifies gets it, not just #1. A different, separate role from
+    !setactivechatrole / !setactivevoicerole, meant specifically to reward well-rounded
+    activity across both. Usage: !setactiveoverallrole @Active Overall"""
     settings = guild_settings.setdefault(str(ctx.guild.id), {})
     if role is None:
         settings.pop("active_overall_role", None)
@@ -1511,7 +1614,18 @@ async def sync_active_roles(guild: discord.Guild):
 
     await apply_qualifying_group(guild, settings.get("active_chat_role"), {uid: d.get("messages", 0) for uid, d in recent.items()}, ACTIVE_ROLE_MIN_MESSAGES)
     await apply_qualifying_group(guild, settings.get("active_voice_role"), {uid: d.get("voice_seconds", 0) for uid, d in recent.items()}, ACTIVE_ROLE_MIN_VOICE_MINUTES * 60)
-    await apply_qualifying_group(guild, settings.get("active_overall_role"), get_overall_activity_score(guild.id, recent), ACTIVE_ROLE_MIN_OVERALL_SCORE)
+
+    # "Overall" means genuinely active in BOTH chat AND voice — a hard AND, not a blended
+    # score. A blended score let someone qualify through chat activity alone (at a bar even
+    # lower than the dedicated chat role's own bar), which meant a brand-new member who'd
+    # never touched voice could still pick up "Active Overall". Requiring both individually
+    # closes that off.
+    overall_qualifiers = {
+        uid: 1
+        for uid, d in recent.items()
+        if d.get("messages", 0) >= ACTIVE_ROLE_MIN_MESSAGES and d.get("voice_seconds", 0) >= ACTIVE_ROLE_MIN_VOICE_MINUTES * 60
+    }
+    await apply_qualifying_group(guild, settings.get("active_overall_role"), overall_qualifiers, 1)
     await sync_yapper_roles(guild)
 
 
@@ -1782,6 +1896,8 @@ async def get_audit_actor(guild: discord.Guild, action: discord.AuditLogAction, 
 
 @bot.event
 async def on_member_ban(guild, user):
+    if user.id in users_being_globally_banned:
+        return  # part of an in-progress !globalban/anti-raid global ban — that command sends one consolidated summary instead
     moderator, reason = await get_audit_actor(guild, discord.AuditLogAction.ban, user.id)
     await mod_log(guild, "Member Banned", user, moderator or "Unknown", reason or "No reason given", discord.Color.red())
 
@@ -1791,12 +1907,24 @@ async def on_member_unban(guild, user):
     moderator, reason = await get_audit_actor(guild, discord.AuditLogAction.unban, user.id)
     await mod_log(guild, "Member Unbanned", user, moderator or "Unknown", reason or "No reason given", discord.Color.green())
 
+    if user.id in users_being_globally_unbanned:
+        return  # this unban IS the intentional !globalunban — don't re-ban them right back
+    if str(user.id) in global_bans_data:
+        # Someone unbanned this account locally, but it's still on the global ban list —
+        # the global ban should keep holding until it's actually lifted with !globalunban.
+        ban_reason = global_bans_data[str(user.id)].get("reason", "No reason given")
+        try:
+            await guild.ban(user, reason=f"GLOBAL BAN (re-enforced — was manually unbanned locally): {ban_reason}")
+            await dm_owner(f"🌐 **{user}** was manually unbanned in **{guild.name}**, but they're still on the global ban list — re-banned automatically. Use !globalunban if you want them actually unbanned everywhere.")
+        except discord.Forbidden:
+            await dm_owner(f"⚠️ **{user}** was manually unbanned in **{guild.name}** and is still globally banned, but I couldn't re-ban them there — missing permission.")
+
 
 @bot.event
 async def on_guild_channel_create(channel):
     """Makes sure new channels automatically get hidden from timed-out members too,
     so the Timed Out role doesn't need manual re-setup every time a channel is added."""
-    timeout_role = discord.utils.get(channel.guild.roles, name=TIMEOUT_ROLE_NAME)
+    timeout_role = get_timeout_role(channel.guild)
     if timeout_role is None:
         return
     timeout_channel = get_guild_channel(channel.guild.id, "timeout_channel")
@@ -1856,19 +1984,35 @@ async def on_member_update(before, after):
     if before.roles != after.roles:
         schedule_auto_backup(after.guild)
 
-    # If someone manually strips the "Timed Out" role off a member who's still actively
-    # serving a timeout (their pre-timeout roles are still stashed, meaning it hasn't
-    # expired/been lifted yet), automatically put it right back — and disconnect them from
-    # voice again in case that's how they got out of the isolation.
-    timeout_role = discord.utils.get(after.guild.roles, name=TIMEOUT_ROLE_NAME)
-    if timeout_role and timeout_role in before.roles and timeout_role not in after.roles:
-        if str(after.id) in stored_roles:
-            try:
-                await after.add_roles(timeout_role, reason="Timeout role removed manually — restored, timeout is still active")
-                if after.voice and after.voice.channel:
-                    await after.move_to(None, reason="Timed out (role was manually removed)")
-            except discord.Forbidden:
-                pass
+    # Enforce an active timeout against tampering — covers two different ways someone could
+    # defeat it: (1) manually removing the Timed Out role itself, and (2) manually GIVING the
+    # timed-out member some other role, which would leave them with real access despite still
+    # technically being "timed out". Only applies while stored_roles still has them as active
+    # — restore_roles deletes that entry FIRST when a timeout properly ends, specifically so
+    # this block can't fight with a legitimate !untimeout or expiry.
+    record = stored_roles.get(str(after.id))
+    if not record or before.roles == after.roles:
+        return
+
+    timeout_role = get_timeout_role(after.guild)
+    if timeout_role is None:
+        return
+
+    extra_roles = [r for r in after.roles if r != after.guild.default_role and r != timeout_role]
+    missing_timeout_role = timeout_role not in after.roles
+
+    if not extra_roles and not missing_timeout_role:
+        return  # nothing to enforce — e.g. this update was our own restore_roles call
+
+    try:
+        if extra_roles:
+            await after.remove_roles(*extra_roles, reason="Timeout still active — stripping role(s) granted while timed out")
+        if missing_timeout_role:
+            await after.add_roles(timeout_role, reason="Timeout role removed manually — restored, timeout is still active")
+        if (extra_roles or missing_timeout_role) and after.voice and after.voice.channel:
+            await after.move_to(None, reason="Timed out (tampered with while active)")
+    except discord.Forbidden:
+        pass
 
 
 # ============================================================
@@ -2387,7 +2531,6 @@ async def grant_xp(member, guild, amount, announce_channel=None):
 ACTIVE_WINDOW_DEFAULT_DAYS = 7   # "weekly" by default — how many days count as "recent" for the active roles/leaderboards
 ACTIVE_ROLE_MIN_MESSAGES = 15    # need at least this many messages in the window to hold the chat-active role
 ACTIVE_ROLE_MIN_VOICE_MINUTES = 20  # need at least this many voice minutes in the window to hold the voice-active role
-ACTIVE_ROLE_MIN_OVERALL_SCORE = min(ACTIVE_ROLE_MIN_MESSAGES * XP_PER_MESSAGE, ACTIVE_ROLE_MIN_VOICE_MINUTES * DEFAULT_VOICE_XP_PER_MINUTE)  # combined chat+voice score needed for the overall-active role
 ACTIVITY_RETENTION_DAYS = 60     # daily buckets older than this get pruned regardless of window, to keep the file small
 
 
@@ -2457,20 +2600,6 @@ def get_lifetime_activity(guild_id) -> dict:
         if lifetime.get("messages") or lifetime.get("voice_seconds"):
             result[user_id_str] = lifetime
     return result
-
-
-def get_overall_activity_score(guild_id, recent: dict) -> dict:
-    """Combines chat + voice into ONE 'overall activity' score per user, using THIS server's
-    own configured chat-XP-per-message and voice-XP-per-minute as the weighting — so 'overall
-    active' naturally reflects however this server already values chat vs voice engagement,
-    rather than an arbitrary made-up ratio. Returns {user_id_str: combined_score}."""
-    settings = guild_settings.get(str(guild_id), {})
-    xp_per_message = settings.get("xp_per_message", XP_PER_MESSAGE)
-    xp_per_voice_minute = settings.get("voice_xp_per_minute", DEFAULT_VOICE_XP_PER_MINUTE)
-    return {
-        uid: data.get("messages", 0) * xp_per_message + (data.get("voice_seconds", 0) / 60) * xp_per_voice_minute
-        for uid, data in recent.items()
-    }
 
 
 def get_messages_for_day(guild_id, day_key: str) -> dict:
@@ -2888,6 +3017,53 @@ async def giveaway(ctx, duration: str, winners: int, prize: str, image: str = No
     save_json(GIVEAWAYS_FILE, giveaways_data)
 
 
+def compute_giveaway_weight(guild: discord.Guild, user_id_str: str, entry_record) -> float:
+    """Returns 0 if the member left the server or holds a blacklisted role; otherwise their
+    entry count plus any bonus entries from their roles or a personal bonus, using THIS
+    server's giveaway settings."""
+    member = guild.get_member(int(user_id_str))
+    if member is None:
+        return 0
+    settings = guild_settings.get(str(guild.id), {})
+    blacklist = set(settings.get("giveaway_blacklist_roles", []))
+    if any(r.id in blacklist for r in member.roles):
+        return 0
+    base = entry_record.get("count", 1) if isinstance(entry_record, dict) else 1
+    bonus_roles = settings.get("giveaway_bonus_roles", {})
+    role_bonus = sum(bonus_roles.get(str(r.id), 0) for r in member.roles)
+    member_bonus = settings.get("giveaway_bonus_members", {}).get(user_id_str, 0)
+    return max(0, base + role_bonus + member_bonus)
+
+
+def weighted_sample_without_replacement(weighted_items: dict, k: int):
+    """weighted_items: {item: weight}. Returns up to k unique items sampled without
+    replacement — higher weight means more likely to be picked, but nobody can win twice."""
+    pool = list(weighted_items.items())
+    winners = []
+    for _ in range(min(k, len(pool))):
+        total = sum(w for _, w in pool)
+        if total <= 0:
+            break
+        r = random.uniform(0, total)
+        upto = 0
+        for i, (item, w) in enumerate(pool):
+            upto += w
+            if upto >= r:
+                winners.append(item)
+                pool.pop(i)
+                break
+    return winners
+
+
+def normalize_giveaway_entrants(data: dict) -> dict:
+    """Returns data's entrants as the current {user_id_str: {"count", "last_entry_day"}}
+    shape, converting on the fly if it's still the old plain-list format."""
+    entrants = data.get("entrants", {})
+    if isinstance(entrants, list):
+        entrants = {str(uid): {"count": 1} for uid in entrants}
+    return entrants
+
+
 async def end_giveaway(message_id: str, data: dict):
     guild = bot.get_guild(data["guild_id"])
     channel = guild.get_channel(data["channel_id"]) if guild else None
@@ -2902,13 +3078,14 @@ async def end_giveaway(message_id: str, data: dict):
         save_json(GIVEAWAYS_FILE, giveaways_data)
         return
 
-    entrants = [guild.get_member(uid) for uid in data.get("entrants", [])]
-    entrants = [m for m in entrants if m is not None]  # drop anyone who left the server
+    entrants = normalize_giveaway_entrants(data)
+    weights = {uid: compute_giveaway_weight(guild, uid, record) for uid, record in entrants.items()}
+    weights = {uid: w for uid, w in weights.items() if w > 0}
 
-    if entrants:
-        pick_count = min(data["winners"], len(entrants))
-        pick = random.sample(entrants, pick_count)
-        winner_mentions = ", ".join(w.mention for w in pick)
+    if weights:
+        pick_count = min(data["winners"], len(weights))
+        winner_ids = weighted_sample_without_replacement(weights, pick_count)
+        winner_mentions = ", ".join(f"<@{uid}>" for uid in winner_ids)
         result_text = f"🎉 Congrats {winner_mentions}! You won **{data['prize']}**!"
     else:
         winner_mentions = "None — no valid entries"
@@ -2916,7 +3093,7 @@ async def end_giveaway(message_id: str, data: dict):
 
     ended_embed = discord.Embed(
         title="🎉 GIVEAWAY ENDED 🎉",
-        description=f"**{data['prize']}**\n\nWinner(s): {winner_mentions}",
+        description=f"**{data['prize']}**\n\nWinner(s): {winner_mentions}\nTotal entrants: {len(entrants)}",
         color=discord.Color.dark_grey(),
     )
     try:
@@ -2954,18 +3131,118 @@ async def gend(ctx, message_id: str):
 @bot.hybrid_command()
 @has_permissions_or_owner(manage_guild=True)
 async def greroll(ctx, message_id: str):
-    """Re-picks one winner for an ALREADY-ENDED giveaway. Usage: !greroll <message_id>"""
+    """Re-picks a winner for an ALREADY-ENDED giveaway, using the same entrant/weighting data.
+    Usage: !greroll <message_id>"""
     data = giveaways_data.get(message_id)
-    entrant_ids = data.get("entrants", []) if data else []
-    if not entrant_ids:
+    entrants = normalize_giveaway_entrants(data) if data else {}
+    if not entrants:
         await ctx.send(embed=discord.Embed(description="No stored entrants to reroll from for that giveaway (either it's too old, or nobody entered).", color=discord.Color.red()))
         return
-    entrants = [m for m in (ctx.guild.get_member(uid) for uid in entrant_ids) if m is not None]
-    if not entrants:
-        await ctx.send(embed=discord.Embed(description="Nobody who entered is still in the server.", color=discord.Color.red()))
+    weights = {uid: compute_giveaway_weight(ctx.guild, uid, record) for uid, record in entrants.items()}
+    weights = {uid: w for uid, w in weights.items() if w > 0}
+    if not weights:
+        await ctx.send(embed=discord.Embed(description="Nobody who entered is still eligible (left the server, or now blacklisted).", color=discord.Color.red()))
         return
-    winner = random.choice(entrants)
-    await ctx.send(embed=discord.Embed(description=f"🎉 New winner: {winner.mention}!", color=discord.Color.fuchsia()))
+    winner_id = weighted_sample_without_replacement(weights, 1)[0]
+    await ctx.send(embed=discord.Embed(description=f"🎉 New winner: <@{winner_id}>!", color=discord.Color.fuchsia()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+async def giveawayentrants(ctx, message_id: str):
+    """Shows who's entered an active giveaway, and how many entries each person has (from
+    bonus roles/members or daily entries). Usage: !giveawayentrants <message_id>"""
+    data = giveaways_data.get(message_id)
+    if not data:
+        await ctx.send(embed=discord.Embed(description="No active giveaway with that message ID.", color=discord.Color.red()))
+        return
+    entrants = normalize_giveaway_entrants(data)
+    if not entrants:
+        await ctx.send(embed=discord.Embed(description=f"Nobody has entered **{data['prize']}** yet.", color=discord.Color.greyple()))
+        return
+    total_entries = sum(r.get("count", 1) if isinstance(r, dict) else 1 for r in entrants.values())
+    lines = []
+    for uid, r in entrants.items():
+        count = r.get("count", 1) if isinstance(r, dict) else 1
+        lines.append(f"<@{uid}> — {count} entr{'y' if count == 1 else 'ies'}")
+    shown = lines[:25]
+    description = "\n".join(shown)
+    if len(lines) > 25:
+        description += f"\n…and {len(lines) - 25} more"
+    embed = discord.Embed(title=f"🎉 Entrants — {data['prize']}", description=description, color=discord.Color.blurple())
+    embed.set_footer(text=f"{len(entrants)} unique member(s), {total_entries} total entries")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(role="Role to toggle on/off the giveaway blacklist")
+async def togglegiveawayblacklist(ctx, role: discord.Role):
+    """Blocks (or unblocks) a role from entering any giveaway in THIS server at all.
+    Usage: !togglegiveawayblacklist @Muted"""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    blacklist = settings.setdefault("giveaway_blacklist_roles", [])
+    if role.id in blacklist:
+        blacklist.remove(role.id)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description=f"✅ {role.mention} can enter giveaways again.", color=discord.Color.green()))
+    else:
+        blacklist.append(role.id)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description=f"🚫 {role.mention} is now blocked from entering giveaways.", color=discord.Color.orange()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(role="Role to grant bonus giveaway entries to", extra_entries="How many EXTRA entries on top of the normal 1 (0 removes the bonus)")
+async def setgiveawaybonusrole(ctx, role: discord.Role, extra_entries: int):
+    """Gives everyone with this role extra giveaway entries in THIS server.
+    Usage: !setgiveawaybonusrole @VIP 2"""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    bonus = settings.setdefault("giveaway_bonus_roles", {})
+    if extra_entries <= 0:
+        bonus.pop(str(role.id), None)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description=f"🛑 Removed the giveaway bonus from {role.mention}.", color=discord.Color.orange()))
+        return
+    bonus[str(role.id)] = extra_entries
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"✅ {role.mention} now gets **+{extra_entries}** bonus giveaway entries.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(member="Member to grant bonus giveaway entries to", extra_entries="How many EXTRA entries on top of the normal 1 (0 removes the bonus)")
+async def setgiveawaybonusmember(ctx, member: discord.Member, extra_entries: int):
+    """Gives one specific member extra giveaway entries in THIS server.
+    Usage: !setgiveawaybonusmember @someone 3"""
+    settings = guild_settings.setdefault(str(ctx.guild.id), {})
+    bonus = settings.setdefault("giveaway_bonus_members", {})
+    if extra_entries <= 0:
+        bonus.pop(str(member.id), None)
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+        await ctx.send(embed=discord.Embed(description=f"🛑 Removed the giveaway bonus from {member.mention}.", color=discord.Color.orange()))
+        return
+    bonus[str(member.id)] = extra_entries
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"✅ {member.mention} now gets **+{extra_entries}** bonus giveaway entries.", color=discord.Color.green()))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@has_permissions_or_owner(manage_guild=True)
+@discord.app_commands.describe(state="Turn daily bonus entries on or off")
+async def togglegiveawaydailyentries(ctx, state: typing.Literal["on", "off"]):
+    """When ON, clicking Enter on a DIFFERENT day than your last click adds another entry
+    (stacking daily) instead of just toggling you in/out once. Clicking again on the SAME
+    day still leaves the giveaway. Usage: !togglegiveawaydailyentries on"""
+    guild_settings.setdefault(str(ctx.guild.id), {})["giveaway_daily_entries"] = (state == "on")
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await ctx.send(embed=discord.Embed(description=f"✅ Daily bonus entries are now **{state}** for giveaways in this server.", color=discord.Color.green()))
 
 
 # ============================================================
@@ -3128,22 +3405,47 @@ async def on_message(message):
 # ============================================================
 # CUSTOM TIMEOUT SYSTEM
 # ============================================================
-async def custom_timeout(member: discord.Member, guild: discord.Guild, minutes: int, reason: str = "No reason given", moderator=None):
-    timeout_role = discord.utils.get(guild.roles, name=TIMEOUT_ROLE_NAME)
-    timeout_channel = get_guild_channel(guild.id, "timeout_channel")
+def get_timeout_role(guild: discord.Guild):
+    """Returns this server's configured timeout role if one's been set with !settimeoutrole,
+    otherwise falls back to a role literally named 'Timed Out' if one already exists.
+    Returns None if neither exists — use get_or_create_timeout_role when one must exist."""
+    role_id = guild_settings.get(str(guild.id), {}).get("timeout_role_id")
+    role = guild.get_role(role_id) if role_id else None
+    if role:
+        return role
+    return discord.utils.get(guild.roles, name=TIMEOUT_ROLE_NAME)
 
-    if timeout_role is None:
-        timeout_role = await guild.create_role(name=TIMEOUT_ROLE_NAME, reason="Auto-created for timeout system")
-        for channel in guild.channels:
-            try:
-                if timeout_channel and channel.id == timeout_channel.id:
-                    # The timeout channel itself: they CAN see it, but can't talk/speak/react in it
-                    await channel.set_permissions(timeout_role, view_channel=True, send_messages=False, speak=False, add_reactions=False)
-                else:
-                    # Every other channel: fully hidden from them
-                    await channel.set_permissions(timeout_role, view_channel=False, send_messages=False, speak=False)
-            except discord.Forbidden:
-                pass
+
+async def setup_timeout_role_permissions(guild: discord.Guild, role: discord.Role):
+    """(Re)applies the timeout permission setup to a role across every channel — hidden
+    everywhere except the configured timeout channel, where it's visible but silent. Safe
+    to call any time, not just once — e.g. !settimeoutchannel calls this again so changing
+    the timeout channel later actually updates which channel is exempted."""
+    timeout_channel = get_guild_channel(guild.id, "timeout_channel")
+    for channel in guild.channels:
+        try:
+            if timeout_channel and channel.id == timeout_channel.id:
+                await channel.set_permissions(role, view_channel=True, send_messages=False, speak=False, add_reactions=False)
+            else:
+                await channel.set_permissions(role, view_channel=False, send_messages=False, speak=False)
+        except discord.Forbidden:
+            pass
+
+
+async def get_or_create_timeout_role(guild: discord.Guild):
+    """Returns this server's timeout role, auto-creating one named 'Timed Out' (and setting
+    up its permissions across every channel) the first time it's ever needed, if nothing's
+    configured with !settimeoutrole and no role named 'Timed Out' already exists."""
+    role = get_timeout_role(guild)
+    if role is None:
+        role = await guild.create_role(name=TIMEOUT_ROLE_NAME, reason="Auto-created for timeout system")
+        await setup_timeout_role_permissions(guild, role)
+    return role
+
+
+async def custom_timeout(member: discord.Member, guild: discord.Guild, minutes: int, reason: str = "No reason given", moderator=None):
+    timeout_role = await get_or_create_timeout_role(guild)
+    timeout_channel = get_guild_channel(guild.id, "timeout_channel")
 
     current_role_ids = [role.id for role in member.roles if role != guild.default_role]
     stored_roles[str(member.id)] = {
@@ -3183,19 +3485,35 @@ async def custom_timeout(member: discord.Member, guild: discord.Guild, minutes: 
 
 
 async def restore_roles(member: discord.Member, guild: discord.Guild):
-    record = stored_roles.get(str(member.id))
-    timeout_role = discord.utils.get(guild.roles, name=TIMEOUT_ROLE_NAME)
+    # Delete the "still actively timed out" record FIRST, before touching any roles — this
+    # is what stops the timeout-enforcement logic in on_member_update from fighting with us:
+    # if it ran to check between our two role changes below and the record still existed,
+    # it would see the member's roles temporarily changing and think someone was tampering,
+    # putting the timeout role right back on even though we're the ones ending it properly.
+    record = stored_roles.pop(str(member.id), None)
+    if record is not None:
+        save_json(ROLES_FILE, stored_roles)
 
-    if timeout_role and timeout_role in member.roles:
-        await member.remove_roles(timeout_role, reason="Timeout expired")
+    timeout_role = get_timeout_role(guild)
+    if timeout_role:
+        # Unconditional — don't gate this on "if timeout_role in member.roles" first. That
+        # check can read a stale cached member (e.g. right after someone else's role edit
+        # hasn't fully propagated yet), silently skipping the removal and leaving the
+        # timeout role stuck on even though the timeout is supposed to be over. Removing a
+        # role a member doesn't actually have is a harmless no-op, so there's no downside.
+        try:
+            await member.remove_roles(timeout_role, reason="Timeout expired")
+        except discord.Forbidden:
+            pass
 
     if record:
         saved_ids = record.get("role_ids", []) if isinstance(record, dict) else record  # tolerate the old plain-list format
         roles = [guild.get_role(rid) for rid in saved_ids if guild.get_role(rid)]
         if roles:
-            await member.add_roles(*roles, reason="Timeout expired — restoring roles")
-        del stored_roles[str(member.id)]
-        save_json(ROLES_FILE, stored_roles)
+            try:
+                await member.add_roles(*roles, reason="Timeout expired — restoring roles")
+            except discord.Forbidden:
+                pass
 
     await mod_log(guild, "Timeout Expired — Roles Restored", member, bot.user, "Automatic", discord.Color.green())
 
@@ -3338,18 +3656,26 @@ async def ban(ctx, member: discord.Member, *, reason="No reason given"):
 # rejoin anywhere. This is what anti-raid auto-bans use too — a raid ban isn't just local to
 # the server that got raided, it follows that account everywhere the bot has a presence.
 # ============================================================
+users_being_globally_banned = set()    # suppresses the per-guild "Member Banned" mod-log DM while a single !globalban (or anti-raid global ban) is banning across every server — one consolidated summary gets sent instead of one per server
+users_being_globally_unbanned = set()  # suppresses the auto-re-ban-if-still-globally-banned enforcement while !globalunban is intentionally lifting a ban
+
+
 async def apply_global_ban(user_id: int, reason: str):
     """Bans a user from every server the bot is currently in. Returns (success_count, [server
     names it couldn't ban in])."""
     success = 0
     failed = []
     user_obj = discord.Object(id=user_id)
-    for guild in bot.guilds:
-        try:
-            await guild.ban(user_obj, reason=reason)
-            success += 1
-        except discord.HTTPException:
-            failed.append(guild.name)
+    users_being_globally_banned.add(user_id)
+    try:
+        for guild in bot.guilds:
+            try:
+                await guild.ban(user_obj, reason=reason)
+                success += 1
+            except discord.HTTPException:
+                failed.append(guild.name)
+    finally:
+        users_being_globally_banned.discard(user_id)
     return success, failed
 
 
@@ -3387,14 +3713,18 @@ async def globalunban(ctx, user: discord.User):
 
     success = 0
     failed = []
-    for guild in bot.guilds:
-        try:
-            await guild.unban(user, reason=f"Global ban lifted by bot owner ({ctx.author})")
-            success += 1
-        except discord.NotFound:
-            pass  # wasn't banned there — nothing to do
-        except discord.HTTPException:
-            failed.append(guild.name)
+    users_being_globally_unbanned.add(user.id)
+    try:
+        for guild in bot.guilds:
+            try:
+                await guild.unban(user, reason=f"Global ban lifted by bot owner ({ctx.author})")
+                success += 1
+            except discord.NotFound:
+                pass  # wasn't banned there — nothing to do
+            except discord.HTTPException:
+                failed.append(guild.name)
+    finally:
+        users_being_globally_unbanned.discard(user.id)
 
     embed = discord.Embed(description=f"✅ Lifted the global ban on **{user}** — unbanned in {success} server(s) where they were banned.", color=discord.Color.green())
     if not was_tracked:
@@ -3903,7 +4233,7 @@ async def listbackups(ctx):
 # ============================================================
 DATA_FILES_FOR_EXPORT = [
     ROLES_FILE, LEVELS_FILE, REACTION_ROLES_FILE, AFK_FILE,
-    GUILD_SETTINGS_FILE, BIRTHDAYS_FILE, GIVEAWAYS_FILE, STARBOARD_FILE, INVITES_FILE, GLOBAL_BANS_FILE, ACTIVITY_FILE,
+    GUILD_SETTINGS_FILE, BIRTHDAYS_FILE, GIVEAWAYS_FILE, STARBOARD_FILE, INVITES_FILE, GLOBAL_BANS_FILE, ACTIVITY_FILE, ROLE_MENUS_FILE,
 ]
 
 
@@ -3941,6 +4271,7 @@ def reload_all_data():
     refresh(invite_data, INVITES_FILE)
     refresh(global_bans_data, GLOBAL_BANS_FILE)
     refresh(activity_data, ACTIVITY_FILE)
+    refresh(role_menus_data, ROLE_MENUS_FILE)
 
 
 @bot.hybrid_command()
