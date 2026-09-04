@@ -121,6 +121,9 @@ RAID_ACTION = "kick"           # "kick" or "ban" for new accounts caught during 
 AUTO_LOCKDOWN_ON_RAID = True   # if True, automatically locks all channels when a raid is detected
 
 XP_PER_MESSAGE = 15
+MAX_LEVEL = 100000  # sanity cap — !setlevel/!addxp can't push anyone past this. Purely a
+                     # safety net: nothing legitimate needs a level this high, and it keeps
+                     # a typo'd extra zero or two from producing a genuinely absurd value.
 XP_COOLDOWN_SECONDS = 60
 # LEVEL_UP_CHANNEL_ID removed — level-up announcements now default to wherever the message
 # was sent, or a per-server configured channel (!setlevelupchannel).
@@ -1834,6 +1837,9 @@ async def setlevel(ctx, member: discord.Member, level: int):
     if level < 0:
         await ctx.send(embed=discord.Embed(description="Level can't be negative.", color=discord.Color.red()))
         return
+    if level > MAX_LEVEL:
+        await ctx.send(embed=discord.Embed(description=f"That's way higher than needed — the cap is **{MAX_LEVEL}**.", color=discord.Color.red()))
+        return
     guild_id = str(ctx.guild.id)
     guild_levels = levels_data.setdefault(guild_id, {})
     guild_levels[str(member.id)] = {"xp": 0, "level": level}
@@ -2418,19 +2424,39 @@ def get_level_xp(level):
 
 
 def total_xp_for(level, xp):
-    """Converts a level+xp pair into one cumulative XP number (used for the global leaderboard)."""
-    total = sum(get_level_xp(lvl) for lvl in range(level))
+    """Converts a level+xp pair into one cumulative XP number (used for the global
+    leaderboard). Closed-form sum instead of looping `level` times — get_level_xp is just a
+    quadratic, so the sum has an exact formula. The loop version was a real production bug:
+    it ran synchronously with no `await` in it, so an unusually large level value turned
+    this into a loop that ran for the better part of an hour, freezing the bot's entire
+    event loop and blocking Discord gateway heartbeats (and every command, in every server)
+    the whole time. This version is O(1) regardless of how large level gets."""
+    n = level
+    if n <= 0:
+        return max(xp, 0)
+    sum_of_squares = (n - 1) * n * (2 * n - 1) // 6
+    sum_of_linear = (n - 1) * n // 2
+    total = 5 * sum_of_squares + 50 * sum_of_linear + 100 * n
     return total + xp
 
 
 def level_from_total(total_xp):
-    """Reverses total_xp_for — turns a cumulative XP number back into a level + remaining xp."""
-    level = 0
-    remaining = total_xp
-    while remaining >= get_level_xp(level):
-        remaining -= get_level_xp(level)
-        level += 1
-    return level, remaining
+    """Reverses total_xp_for — turns a cumulative XP number back into a level + remaining xp.
+    Binary search against the now-O(1) total_xp_for, instead of counting up one level at a
+    time — same reasoning as total_xp_for above: an unbounded loop here is just as capable
+    of freezing the bot if a combined total ever gets large enough."""
+    if total_xp <= 0:
+        return 0, max(total_xp, 0)
+    lo, hi = 0, 1
+    while total_xp_for(hi, 0) <= total_xp:
+        hi *= 2
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if total_xp_for(mid, 0) <= total_xp:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo, total_xp - total_xp_for(lo, 0)
 
 
 async def sync_level_roles_for_member(guild: discord.Guild, member: discord.Member, level: int):
@@ -2495,16 +2521,20 @@ async def grant_xp(member, guild, amount, announce_channel=None):
     user_id = str(member.id)
     guild_levels = levels_data.setdefault(guild_id, {})
     user_data = guild_levels.setdefault(user_id, {"xp": 0, "level": 0})
-    user_data["xp"] += amount
-    if user_data["xp"] < 0:
-        user_data["xp"] = 0
+
+    starting_level = user_data["level"]
+    # Recompute via total XP instead of looping level-by-level — same reasoning as the
+    # total_xp_for/level_from_total fix above: !addxp with a huge number used to turn this
+    # into a loop that ran once per level gained, which is exactly the kind of unbounded
+    # synchronous loop that froze the bot for the better part of an hour last time. This is
+    # O(log n) regardless of how big amount is.
+    current_total = total_xp_for(user_data["level"], user_data["xp"])
+    new_total = max(0, current_total + amount)
+    user_data["level"], user_data["xp"] = level_from_total(new_total)
+    if user_data["level"] > MAX_LEVEL:
+        user_data["level"], user_data["xp"] = MAX_LEVEL, 0
 
     channel = get_guild_channel(guild.id, "level_up_channel") or announce_channel
-    starting_level = user_data["level"]
-
-    while user_data["xp"] >= get_level_xp(user_data["level"]):
-        user_data["xp"] -= get_level_xp(user_data["level"])
-        user_data["level"] += 1
 
     added_role, removed_roles = None, []
     if user_data["level"] > starting_level:
