@@ -3189,8 +3189,9 @@ async def greroll(ctx, message_id: str):
 @commands.guild_only()
 @has_permissions_or_owner(manage_guild=True)
 async def giveawayentrants(ctx, message_id: str):
-    """Shows who's entered an active giveaway, and how many entries each person has (from
-    bonus roles/members or daily entries). Usage: !giveawayentrants <message_id or link>"""
+    """Shows who's entered an active giveaway, and how many EFFECTIVE entries each person
+    has — base entry plus any bonus entries from !setgiveawaybonusrole/!setgiveawaybonusmember
+    — since that's what's actually used when a winner gets picked. Usage: !giveawayentrants <message_id or link>"""
     parsed_id = parse_message_id(message_id)
     if parsed_id is None:
         await ctx.send(embed=discord.Embed(description="Couldn't read a message ID out of that — paste the raw ID or the giveaway message's link.", color=discord.Color.red()))
@@ -3203,17 +3204,20 @@ async def giveawayentrants(ctx, message_id: str):
     if not entrants:
         await ctx.send(embed=discord.Embed(description=f"Nobody has entered **{data['prize']}** yet.", color=discord.Color.greyple()))
         return
-    total_entries = sum(r.get("count", 1) if isinstance(r, dict) else 1 for r in entrants.values())
+
+    weights = {uid: compute_giveaway_weight(ctx.guild, uid, record) for uid, record in entrants.items()}
+    total_entries = sum(weights.values())
     lines = []
-    for uid, r in entrants.items():
-        count = r.get("count", 1) if isinstance(r, dict) else 1
-        lines.append(f"<@{uid}> — {count} entr{'y' if count == 1 else 'ies'}")
+    for uid, weight in weights.items():
+        weight = int(weight)
+        note = "" if weight > 0 else " *(ineligible — left the server, or blacklisted)*"
+        lines.append(f"<@{uid}> — {weight} entr{'y' if weight == 1 else 'ies'}{note}")
     shown = lines[:25]
     description = "\n".join(shown)
     if len(lines) > 25:
         description += f"\n…and {len(lines) - 25} more"
     embed = discord.Embed(title=f"🎉 Entrants — {data['prize']}", description=description, color=discord.Color.blurple())
-    embed.set_footer(text=f"{len(entrants)} unique member(s), {total_entries} total entries")
+    embed.set_footer(text=f"{len(entrants)} unique member(s), {int(total_entries)} total effective entries")
     await ctx.send(embed=embed)
 
 
