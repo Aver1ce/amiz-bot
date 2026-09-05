@@ -3149,12 +3149,16 @@ async def giveaway_check():
 @bot.hybrid_command()
 @has_permissions_or_owner(manage_guild=True)
 async def gend(ctx, message_id: str):
-    """Ends a giveaway early. Usage: !gend <message_id>"""
-    data = giveaways_data.get(message_id)
+    """Ends a giveaway early. Usage: !gend <message_id or link>"""
+    parsed_id = parse_message_id(message_id)
+    if parsed_id is None:
+        await ctx.send(embed=discord.Embed(description="Couldn't read a message ID out of that — paste the raw ID or the giveaway message's link.", color=discord.Color.red()))
+        return
+    data = giveaways_data.get(str(parsed_id))
     if not data:
         await ctx.send(embed=discord.Embed(description="No active giveaway with that message ID.", color=discord.Color.red()))
         return
-    await end_giveaway(message_id, data)
+    await end_giveaway(str(parsed_id), data)
     await ctx.send(embed=discord.Embed(description="✅ Giveaway ended.", color=discord.Color.green()))
 
 
@@ -3162,8 +3166,12 @@ async def gend(ctx, message_id: str):
 @has_permissions_or_owner(manage_guild=True)
 async def greroll(ctx, message_id: str):
     """Re-picks a winner for an ALREADY-ENDED giveaway, using the same entrant/weighting data.
-    Usage: !greroll <message_id>"""
-    data = giveaways_data.get(message_id)
+    Usage: !greroll <message_id or link>"""
+    parsed_id = parse_message_id(message_id)
+    if parsed_id is None:
+        await ctx.send(embed=discord.Embed(description="Couldn't read a message ID out of that — paste the raw ID or the giveaway message's link.", color=discord.Color.red()))
+        return
+    data = giveaways_data.get(str(parsed_id))
     entrants = normalize_giveaway_entrants(data) if data else {}
     if not entrants:
         await ctx.send(embed=discord.Embed(description="No stored entrants to reroll from for that giveaway (either it's too old, or nobody entered).", color=discord.Color.red()))
@@ -3182,8 +3190,12 @@ async def greroll(ctx, message_id: str):
 @has_permissions_or_owner(manage_guild=True)
 async def giveawayentrants(ctx, message_id: str):
     """Shows who's entered an active giveaway, and how many entries each person has (from
-    bonus roles/members or daily entries). Usage: !giveawayentrants <message_id>"""
-    data = giveaways_data.get(message_id)
+    bonus roles/members or daily entries). Usage: !giveawayentrants <message_id or link>"""
+    parsed_id = parse_message_id(message_id)
+    if parsed_id is None:
+        await ctx.send(embed=discord.Embed(description="Couldn't read a message ID out of that — paste the raw ID or the giveaway message's link.", color=discord.Color.red()))
+        return
+    data = giveaways_data.get(str(parsed_id))
     if not data:
         await ctx.send(embed=discord.Embed(description="No active giveaway with that message ID.", color=discord.Color.red()))
         return
