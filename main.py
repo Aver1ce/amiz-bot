@@ -338,7 +338,9 @@ async def global_owner_lock(ctx):
 
 async def mod_log(guild: discord.Guild, action: str, target, moderator, reason: str = "No reason given", color=discord.Color.orange()):
     """Posts a clean embed to the mod-log channel recording who did what to whom and why.
-    Also DMs the owner a short version so nothing gets missed."""
+    Also DMs the owner a short version so nothing gets missed. For rare/important events
+    (bans, timeouts, role/channel changes) — for high-volume stuff like message edits and
+    deletes, use channel_log() instead so the owner's DMs don't get flooded."""
     channel = get_guild_channel(guild.id, "mod_log_channel")
     embed = discord.Embed(title=f"🛡️ {action}", color=color, timestamp=datetime.datetime.now(datetime.timezone.utc))
     embed.add_field(name="Target", value=f"{target} (`{target.id}`)", inline=True)
@@ -347,6 +349,18 @@ async def mod_log(guild: discord.Guild, action: str, target, moderator, reason: 
     if channel:
         await channel.send(embed=embed)
     await dm_owner(f"🛡️ **{action}** — {target} by {moderator}. Reason: {reason}")
+
+
+async def channel_log(guild: discord.Guild, embed: discord.Embed):
+    """Posts an embed to the mod-log channel ONLY — no DM to the owner. Used for high-volume
+    events (message edits/deletes) where DMing every single one would flood the owner; rare
+    moderation actions still go through mod_log(), which does also DM."""
+    channel = get_guild_channel(guild.id, "mod_log_channel")
+    if channel:
+        try:
+            await channel.send(embed=embed)
+        except discord.Forbidden:
+            pass
 
 
 # ============================================================
@@ -370,6 +384,8 @@ async def setup_hook():
         timeout_expiry_check.start()
     if not voice_reconnect_check.is_running():
         voice_reconnect_check.start()
+    if not bump_reminder_check.is_running():
+        bump_reminder_check.start()
 
 
 async def cache_guild_invites(guild: discord.Guild):
@@ -1931,30 +1947,38 @@ async def on_guild_channel_create(channel):
     """Makes sure new channels automatically get hidden from timed-out members too,
     so the Timed Out role doesn't need manual re-setup every time a channel is added."""
     timeout_role = get_timeout_role(channel.guild)
-    if timeout_role is None:
-        return
-    timeout_channel = get_guild_channel(channel.guild.id, "timeout_channel")
-    try:
-        if timeout_channel and channel.id == timeout_channel.id:
-            await channel.set_permissions(timeout_role, view_channel=True, send_messages=False, speak=False, add_reactions=False)
-        else:
-            await channel.set_permissions(timeout_role, view_channel=False, send_messages=False, speak=False)
-    except discord.Forbidden:
-        pass
+    if timeout_role:
+        timeout_channel = get_guild_channel(channel.guild.id, "timeout_channel")
+        try:
+            if timeout_channel and channel.id == timeout_channel.id:
+                await channel.set_permissions(timeout_role, view_channel=True, send_messages=False, speak=False, add_reactions=False)
+            else:
+                await channel.set_permissions(timeout_role, view_channel=False, send_messages=False, speak=False)
+        except discord.Forbidden:
+            pass
     schedule_auto_backup(channel.guild)
 
+    if channel.guild.id in guilds_in_bulk_delete:
+        return  # part of a !restoreserver run — the single "Restore Complete" summary covers this
+    moderator, reason = await get_audit_actor(channel.guild, discord.AuditLogAction.channel_create, channel.id)
+    kind = "category" if isinstance(channel, discord.CategoryChannel) else str(channel.type)
+    await mod_log(channel.guild, "Channel Created", channel, moderator or "Unknown", f"#{channel.name} ({kind}) — {reason or 'No reason given'}", discord.Color.green())
 
-guilds_in_bulk_delete = set()  # guild IDs currently undergoing an !anni* wipe — suppresses the
-                                # normal per-channel/per-role mod-log DM so a 40-channel wipe
-                                # doesn't send 40 separate DMs; the anni command sends its own
-                                # single summary instead.
+
+guilds_in_bulk_delete = set()  # guild IDs currently undergoing an !anni* wipe or a !restoreserver
+                                # run — suppresses the normal per-channel/per-role mod-log entry
+                                # so a big operation doesn't spam dozens of individual log lines;
+                                # the command itself sends one consolidated summary instead.
 
 
 @bot.event
 async def on_guild_channel_delete(channel):
-    schedule_auto_backup(channel.guild)
     if channel.guild.id in guilds_in_bulk_delete:
-        return
+        return  # a deliberate !anni* wipe, already confirmed by the owner — skip mod-log spam,
+                 # nuke detection, and auto-backup entirely; run !backupserver by hand after if wanted
+    if record_deletion_and_check_for_nuke(channel.guild):
+        await dm_owner(f"⚠️ Detected a burst of channel/role deletions in **{channel.guild.name}** — could be a raid or an accidental mass-delete. Pausing auto-backup saves there for {NUKE_PAUSE_SECONDS // 60} minutes so this doesn't overwrite your good backup with the damage. Run `!backupserver <name>` manually once things are back to normal if you actually want to save the current state.")
+    schedule_auto_backup(channel.guild)
     moderator, reason = await get_audit_actor(channel.guild, discord.AuditLogAction.channel_delete, channel.id)
     await mod_log(channel.guild, "Channel Deleted", channel, moderator or "Unknown", f"#{channel.name} — {reason or 'No reason given'}", discord.Color.dark_red())
 
@@ -1962,18 +1986,43 @@ async def on_guild_channel_delete(channel):
 @bot.event
 async def on_guild_channel_update(before, after):
     schedule_auto_backup(after.guild)
+    if after.guild.id in guilds_in_bulk_delete:
+        return
+
+    changes = []
+    if before.name != after.name:
+        changes.append(f"Name: `{before.name}` → `{after.name}`")
+    if getattr(before, "topic", None) != getattr(after, "topic", None):
+        changes.append(f"Topic changed")
+    if getattr(before, "nsfw", None) != getattr(after, "nsfw", None):
+        changes.append(f"NSFW: `{before.nsfw}` → `{after.nsfw}`")
+    if getattr(before, "slowmode_delay", None) != getattr(after, "slowmode_delay", None):
+        changes.append(f"Slowmode: `{before.slowmode_delay}s` → `{after.slowmode_delay}s`")
+    if before.category != after.category:
+        changes.append(f"Category: `{before.category}` → `{after.category}`")
+    if not changes:
+        return  # e.g. only permission overwrites changed, or position shuffled — too noisy to log every time
+
+    moderator, reason = await get_audit_actor(after.guild, discord.AuditLogAction.channel_update, after.id)
+    await mod_log(after.guild, "Channel Updated", after, moderator or "Unknown", "\n".join(changes), discord.Color.blue())
 
 
 @bot.event
 async def on_guild_role_create(role):
     schedule_auto_backup(role.guild)
+    if role.guild.id in guilds_in_bulk_delete:
+        return  # part of a !restoreserver run — the single "Restore Complete" summary covers this
+    moderator, reason = await get_audit_actor(role.guild, discord.AuditLogAction.role_create, role.id)
+    await mod_log(role.guild, "Role Created", role, moderator or "Unknown", f"@{role.name} — {reason or 'No reason given'}", discord.Color.green())
 
 
 @bot.event
 async def on_guild_role_delete(role):
-    schedule_auto_backup(role.guild)
     if role.guild.id in guilds_in_bulk_delete:
         return
+    if record_deletion_and_check_for_nuke(role.guild):
+        await dm_owner(f"⚠️ Detected a burst of channel/role deletions in **{role.guild.name}** — could be a raid or an accidental mass-delete. Pausing auto-backup saves there for {NUKE_PAUSE_SECONDS // 60} minutes so this doesn't overwrite your good backup with the damage. Run `!backupserver <name>` manually once things are back to normal if you actually want to save the current state.")
+    schedule_auto_backup(role.guild)
     moderator, reason = await get_audit_actor(role.guild, discord.AuditLogAction.role_delete, role.id)
     await mod_log(role.guild, "Role Deleted", role, moderator or "Unknown", f"@{role.name} — {reason or 'No reason given'}", discord.Color.dark_red())
 
@@ -1981,6 +2030,25 @@ async def on_guild_role_delete(role):
 @bot.event
 async def on_guild_role_update(before, after):
     schedule_auto_backup(after.guild)
+    if after.guild.id in guilds_in_bulk_delete:
+        return
+
+    changes = []
+    if before.name != after.name:
+        changes.append(f"Name: `{before.name}` → `{after.name}`")
+    if before.color != after.color:
+        changes.append(f"Color: `{before.color}` → `{after.color}`")
+    if before.hoist != after.hoist:
+        changes.append(f"Hoisted: `{before.hoist}` → `{after.hoist}`")
+    if before.mentionable != after.mentionable:
+        changes.append(f"Mentionable: `{before.mentionable}` → `{after.mentionable}`")
+    if before.permissions != after.permissions:
+        changes.append("Permissions changed")
+    if not changes:
+        return  # e.g. only position shuffled — too noisy to log every time
+
+    moderator, reason = await get_audit_actor(after.guild, discord.AuditLogAction.role_update, after.id)
+    await mod_log(after.guild, "Role Updated", after, moderator or "Unknown", "\n".join(changes), discord.Color.blue())
 
 
 @bot.event
@@ -3387,8 +3455,134 @@ async def ask_ai(message: discord.Message):
 # ============================================================
 # MESSAGE HANDLING (automod + XP + AI/free chat)
 # ============================================================
+recently_automod_deleted_message_ids = set()  # message IDs the bot just deleted itself via
+                                                # AutoMod (banned word / mass mention) — lets
+                                                # on_message_delete skip re-logging these, since
+                                                # the AutoMod log below already covers them with
+                                                # more specific detail (which rule, etc)
+
+
+@bot.event
+async def on_message_delete(message):
+    """Detailed message-delete logging, like Discord's own audit log — who sent it, what it
+    said, which channel, and (via the audit log) who deleted it if it wasn't the author
+    themselves. Posts to the mod-log channel only (channel_log, not mod_log) since message
+    deletions happen constantly during normal use — DMing the owner for every one would be
+    nonstop spam."""
+    if message.author.bot or message.guild is None:
+        return
+    if message.id in recently_automod_deleted_message_ids:
+        recently_automod_deleted_message_ids.discard(message.id)
+        return  # already logged with more detail by the AutoMod handler that deleted it
+
+    moderator, _ = await get_audit_actor(message.guild, discord.AuditLogAction.message_delete, message.author.id)
+    deleted_by = f"{moderator} (moderator)" if moderator else f"{message.author} (likely themselves)"
+    content = message.content or "*(no text — image/embed/attachment only)*"
+    if len(content) > 950:
+        content = content[:950] + "…"
+
+    embed = discord.Embed(title="🗑️ Message Deleted", color=discord.Color.dark_red(), timestamp=datetime.datetime.now(datetime.timezone.utc))
+    embed.add_field(name="Author", value=f"{message.author} (`{message.author.id}`)", inline=True)
+    embed.add_field(name="Channel", value=getattr(message.channel, "mention", str(message.channel)), inline=True)
+    embed.add_field(name="Deleted by", value=deleted_by, inline=True)
+    embed.add_field(name="Content", value=content, inline=False)
+    await channel_log(message.guild, embed)
+
+
+@bot.event
+async def on_message_edit(before, after):
+    """Detailed message-edit logging — before/after content, author, channel. Posts to the
+    mod-log channel only (not a DM) for the same reason as on_message_delete: too high-volume
+    to DM the owner for every one."""
+    if before.author.bot or after.guild is None:
+        return
+    if before.content == after.content:
+        return  # e.g. just a link-preview embed loading in, not an actual text edit
+
+    before_content = before.content or "*(empty)*"
+    after_content = after.content or "*(empty)*"
+    if len(before_content) > 500:
+        before_content = before_content[:500] + "…"
+    if len(after_content) > 500:
+        after_content = after_content[:500] + "…"
+
+    embed = discord.Embed(title="✏️ Message Edited", color=discord.Color.blue(), timestamp=datetime.datetime.now(datetime.timezone.utc))
+    embed.add_field(name="Author", value=f"{after.author} (`{after.author.id}`)", inline=True)
+    embed.add_field(name="Channel", value=getattr(after.channel, "mention", str(after.channel)), inline=True)
+    embed.add_field(name="Jump", value=f"[Go to message]({after.jump_url})", inline=True)
+    embed.add_field(name="Before", value=before_content, inline=False)
+    embed.add_field(name="After", value=after_content, inline=False)
+    await channel_log(after.guild, embed)
+
+
+DISBOARD_BOT_ID = 302050872383242240
+DISBOARD_BUMP_COOLDOWN_SECONDS = 2 * 60 * 60  # Disboard's own cooldown between /bump uses
+
+
+async def check_for_disboard_bump(message: discord.Message):
+    """Detects a successful Disboard /bump — its confirmation embed says 'Bump done!' — and
+    schedules a reminder for when the 2-hour cooldown ends. Persisted (not an in-memory
+    sleep), so it survives a bot restart mid-cooldown instead of just forgetting."""
+    if not message.embeds:
+        return
+    embed = message.embeds[0]
+    text = f"{embed.title or ''} {embed.description or ''}".lower()
+    if "bump done" not in text:
+        return
+
+    ready_at = datetime.datetime.now(datetime.timezone.utc).timestamp() + DISBOARD_BUMP_COOLDOWN_SECONDS
+    guild_settings.setdefault(str(message.guild.id), {})["bump_reminder"] = {
+        "channel_id": message.channel.id,
+        "ready_at": ready_at,
+        "sent": False,
+    }
+    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    await message.channel.send(embed=discord.Embed(description=f"⏰ Got it — I'll remind you here <t:{int(ready_at)}:R> when this server can be bumped again.", color=discord.Color.blurple()))
+
+
+@tasks.loop(minutes=1)
+async def bump_reminder_check():
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    changed = False
+    for guild_id_str, settings in guild_settings.items():
+        reminder = settings.get("bump_reminder")
+        if not reminder or reminder.get("sent") or reminder["ready_at"] > now:
+            continue
+        guild = bot.get_guild(int(guild_id_str))
+        channel = guild.get_channel(reminder["channel_id"]) if guild else None
+        if channel:
+            try:
+                await channel.send(embed=discord.Embed(description="⏰ This server can be bumped again! Run `/bump` to boost it on Disboard.", color=discord.Color.green()))
+            except discord.Forbidden:
+                pass
+        await dm_owner(f"⏰ **{guild.name if guild else guild_id_str}** can be bumped again on Disboard!")
+        reminder["sent"] = True
+        changed = True
+    if changed:
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def bumpstatus(ctx):
+    """Shows how long until this server can be bumped on Disboard again, if a bump has been
+    tracked. Usage: !bumpstatus"""
+    reminder = guild_settings.get(str(ctx.guild.id), {}).get("bump_reminder")
+    if not reminder:
+        await ctx.send(embed=discord.Embed(description="No bump tracked yet — I'll start the countdown automatically the next time someone successfully `/bump`s with Disboard in a channel I can see.", color=discord.Color.greyple()))
+        return
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    if reminder["ready_at"] <= now:
+        await ctx.send(embed=discord.Embed(description="✅ Ready to bump again right now!", color=discord.Color.green()))
+    else:
+        await ctx.send(embed=discord.Embed(description=f"⏰ Can bump again <t:{int(reminder['ready_at'])}:R>.", color=discord.Color.blurple()))
+
+
 @bot.event
 async def on_message(message):
+    if message.author.id == DISBOARD_BOT_ID and message.guild is not None:
+        await check_for_disboard_bump(message)
+
     if message.author.bot:
         return
 
@@ -3399,14 +3593,26 @@ async def on_message(message):
     # None for DMs, so none of it applies (and touching message.guild.id there would crash).
     if message.guild is not None:
         if contains_banned_word(message.content, message.guild.id):
+            recently_automod_deleted_message_ids.add(message.id)
             await message.delete()
             await message.channel.send(embed=discord.Embed(description=f"{message.author.mention}, that language isn't allowed here.", color=discord.Color.red()), delete_after=5)
+            automod_embed = discord.Embed(title="🤖 AutoMod — Banned Word", color=discord.Color.red(), timestamp=datetime.datetime.now(datetime.timezone.utc))
+            automod_embed.add_field(name="Author", value=f"{message.author} (`{message.author.id}`)", inline=True)
+            automod_embed.add_field(name="Channel", value=getattr(message.channel, "mention", str(message.channel)), inline=True)
+            automod_embed.add_field(name="Message", value=(message.content or "")[:950], inline=False)
+            await channel_log(message.guild, automod_embed)
             await dm_owner(f"🚫 Deleted a message from **{message.author}** in #{message.channel} (banned word):\n> {message.content}")
             return
 
         if len(message.mentions) >= 5:
+            recently_automod_deleted_message_ids.add(message.id)
             await message.delete()
             await message.channel.send(embed=discord.Embed(description=f"{message.author.mention}, mass-pinging isn't allowed.", color=discord.Color.red()), delete_after=5)
+            automod_embed = discord.Embed(title="🤖 AutoMod — Mass Mention", color=discord.Color.red(), timestamp=datetime.datetime.now(datetime.timezone.utc))
+            automod_embed.add_field(name="Author", value=f"{message.author} (`{message.author.id}`)", inline=True)
+            automod_embed.add_field(name="Channel", value=getattr(message.channel, "mention", str(message.channel)), inline=True)
+            automod_embed.add_field(name="Mentions", value=str(len(message.mentions)), inline=True)
+            await channel_log(message.guild, automod_embed)
             await dm_owner(f"🚫 Deleted a mass-mention message from **{message.author}** in #{message.channel}")
             return
 
@@ -3904,6 +4110,31 @@ def save_backup(guild, normalized_name, display_name):
 # !autobackup off turns it off if you'd rather keep a save as a frozen snapshot instead.
 auto_backup_tasks = {}  # guild_id -> asyncio.Task, debounces bursts of role/channel events
 
+# --- Nuke/raid protection: never let a burst of deletions overwrite a good backup ----------
+# Without this, a raid (or an accidental mass-delete) would trigger the SAME auto-sync system
+# above, faithfully saving the just-wiped, decimated server right over a perfectly good
+# backup — the exact moment you'd actually need that backup to still be intact.
+recent_deletions = {}          # guild_id -> [timestamps] of recent channel/role deletions
+NUKE_DELETE_THRESHOLD = 5       # this many channel/role deletions...
+NUKE_DELETE_WINDOW_SECONDS = 60  # ...within this many seconds looks like a raid/nuke, not routine cleanup
+NUKE_PAUSE_SECONDS = 600        # once flagged, pause auto-backup saves here for this long
+guilds_nuke_flagged_until = {}  # guild_id -> timestamp until which auto-backup saves are paused
+
+
+def record_deletion_and_check_for_nuke(guild) -> bool:
+    """Tracks channel/role deletions for this server. Returns True the moment a burst of
+    deletions crosses the 'this looks like a raid/nuke, not routine cleanup' threshold
+    (only fires once per burst, not on every deletion after)."""
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    timestamps = [t for t in recent_deletions.get(guild.id, []) if now - t < NUKE_DELETE_WINDOW_SECONDS]
+    timestamps.append(now)
+    recent_deletions[guild.id] = timestamps
+    already_flagged = guilds_nuke_flagged_until.get(guild.id, 0) > now
+    if len(timestamps) >= NUKE_DELETE_THRESHOLD and not already_flagged:
+        guilds_nuke_flagged_until[guild.id] = now + NUKE_PAUSE_SECONDS
+        return True
+    return False
+
 
 async def perform_auto_backup(guild):
     settings = guild_settings.get(str(guild.id), {})
@@ -3926,10 +4157,13 @@ async def _debounced_auto_backup(guild):
 
 def schedule_auto_backup(guild):
     """Call this from any event that changes server structure. No-ops if this server doesn't
-    have an auto-synced backup set up yet."""
+    have an auto-synced backup set up yet, or if a possible raid/nuke was just detected —
+    saves stay paused for a while so a burst of deletions can't get saved over a good backup."""
     if guild is None:
         return
     if not guild_settings.get(str(guild.id), {}).get("auto_backup_name"):
+        return
+    if guilds_nuke_flagged_until.get(guild.id, 0) > datetime.datetime.now(datetime.timezone.utc).timestamp():
         return
     existing = auto_backup_tasks.get(guild.id)
     if existing and not existing.done():
@@ -3942,15 +4176,21 @@ def schedule_auto_backup(guild):
 @backup_permission()
 async def backupserver(ctx, backup_name: str):
     """Saves this server's roles, channels (with permission overwrites), and who has which
-    custom role, to a file — and marks it as the save that stays automatically kept in sync
-    with future role/channel changes here. Usage: !backupserver mybackup. Usable by you (the
-    bot owner, in any server) or by that server's own owner (for their own server only)."""
+    custom role, to a file. If this server doesn't have auto-sync explicitly turned off, this
+    also marks the save as the one that stays automatically kept in sync with future
+    role/channel changes here. Usage: !backupserver mybackup. Usable by you (the bot owner,
+    in any server) or by that server's own owner (for their own server only)."""
     guild = ctx.guild
     normalized = normalize_backup_name(backup_name)
     data = save_backup(guild, normalized, backup_name.strip())
 
-    guild_settings.setdefault(str(guild.id), {})["auto_backup_name"] = normalized
-    save_json(GUILD_SETTINGS_FILE, guild_settings)
+    settings = guild_settings.setdefault(str(guild.id), {})
+    auto_sync_note = ""
+    if settings.get("auto_backup_disabled"):
+        auto_sync_note = " Auto-sync is currently **off** for this server, so this save stays a static snapshot — run `!autobackup on` to resume auto-syncing it."
+    else:
+        settings["auto_backup_name"] = normalized
+        save_json(GUILD_SETTINGS_FILE, guild_settings)
 
     all_backups = list_backup_names(guild.id)
     embed = discord.Embed(
@@ -3960,7 +4200,8 @@ async def backupserver(ctx, backup_name: str):
         color=discord.Color.green(),
     )
     embed.add_field(name="📁 Your saves", value=", ".join(f"`{b}`" for b in all_backups), inline=False)
-    embed.set_footer(text="🔄 This save now stays automatically synced with role/channel changes here — no need to re-run this manually. (Only the bot's creator can toggle auto-sync on/off.)")
+    footer = "🔄 This save now stays automatically synced with role/channel changes here — no need to re-run this manually. (Only the bot's creator can toggle auto-sync on/off.)"
+    embed.set_footer(text=(footer + auto_sync_note) if auto_sync_note else footer)
     await ctx.send(embed=embed)
 
 
@@ -3975,17 +4216,21 @@ async def autobackup(ctx, mode: typing.Literal["status", "on", "off"] = "status"
     """Shows, enables, or disables which backup is kept automatically in sync with THIS
     server's live roles/channels. Bot-creator only — server owners can still make and restore
     backups with !backupserver / !restoreserver, but only you can flip auto-sync on or off.
+    Once you turn it off, it STAYS off — running !backupserver again to make a fresh save
+    won't silently re-enable it; you have to explicitly turn it back on here.
     Usage:
       !autobackup                     — check what's currently auto-syncing
       !autobackup on <name>           — turn auto-sync on for an existing backup
-      !autobackup off                 — turn auto-sync off"""
+      !autobackup off                 — turn auto-sync off (and keep it off)"""
     settings = guild_settings.get(str(ctx.guild.id), {})
     current = settings.get("auto_backup_name")
 
     if mode == "off":
-        guild_settings.setdefault(str(ctx.guild.id), {}).pop("auto_backup_name", None)
+        settings = guild_settings.setdefault(str(ctx.guild.id), {})
+        settings.pop("auto_backup_name", None)
+        settings["auto_backup_disabled"] = True
         save_json(GUILD_SETTINGS_FILE, guild_settings)
-        await ctx.send(embed=discord.Embed(description="🛑 Turned off auto-sync for this server. Your existing saves are untouched.", color=discord.Color.orange()))
+        await ctx.send(embed=discord.Embed(description="🛑 Turned off auto-sync for this server — and it'll stay off, even if you run `!backupserver` again later. Your existing saves are untouched.", color=discord.Color.orange()))
         return
 
     if mode == "on":
@@ -4002,7 +4247,9 @@ async def autobackup(ctx, mode: typing.Literal["status", "on", "off"] = "status"
                 color=discord.Color.red(),
             ))
             return
-        guild_settings.setdefault(str(ctx.guild.id), {})["auto_backup_name"] = normalized
+        settings = guild_settings.setdefault(str(ctx.guild.id), {})
+        settings["auto_backup_name"] = normalized
+        settings["auto_backup_disabled"] = False
         save_json(GUILD_SETTINGS_FILE, guild_settings)
         display_name = load_json(path).get("display_name", target)
         await ctx.send(embed=discord.Embed(description=f"🔄 `{display_name}` will now stay automatically synced with this server's roles and channels.", color=discord.Color.green()))
@@ -4128,73 +4375,80 @@ async def restoreserver(
         cross_server_note = f" (cloned from **{source_guild.name if source_guild else source_guild_id}**)"
     await ctx.send(embed=discord.Embed(description=f"🔧 Restoring `{backup_name}`{cross_server_note} ({what_label}) into **{guild.name}**... this may take a bit.", color=discord.Color.blurple()))
 
-    # Recreate roles first (bottom to top, matches saved order), keep a name -> role object map.
-    # If we're not restoring roles this run, role_map stays empty — channel overwrites that
-    # reference a role by name simply get skipped below (they'll match existing roles by name
-    # if that role already exists in the server from a prior restore).
-    role_map = {}
-    if restore_roles:
-        for role_data in data["roles"]:
-            new_role = await guild.create_role(
-                name=role_data["name"],
-                color=discord.Color(role_data["color"]),
-                permissions=discord.Permissions(role_data["permissions"]),
-                hoist=role_data["hoist"],
-                mentionable=role_data["mentionable"],
-                reason=f"Server restore from backup '{backup_name}' (roles)",
-            )
-            role_map[role_data["name"]] = new_role
-    elif restore_channels:
-        # Channels-only restore: match overwrites against roles that already exist in this
-        # server by name, so a prior roles-only restore (or existing roles) still get wired up.
-        role_map = {role.name: role for role in guild.roles}
-
-    # Recreate categories, keep a name -> object map for channel placement
-    category_map = {}
-    if restore_channels:
-        for cat_data in data["categories"]:
-            cat = await guild.create_category(cat_data["name"], reason=f"Server restore from backup '{backup_name}' (channels)")
-            category_map[cat_data["name"]] = cat
-
-    # Recreate channels into their categories, then re-apply saved permission overwrites
-    if restore_channels:
-        for chan_data in data["channels"]:
-            category = category_map.get(chan_data["category"])
-            if chan_data["type"] == "voice":
-                new_channel = await guild.create_voice_channel(chan_data["name"], category=category, reason=f"Server restore from backup '{backup_name}' (channels)")
-            else:
-                new_channel = await guild.create_text_channel(
-                    chan_data["name"], category=category, topic=chan_data.get("topic"),
-                    reason=f"Server restore from backup '{backup_name}' (channels)"
+    # Suppress the normal per-role/per-channel "Created" log entries for the duration of the
+    # restore — recreating dozens of roles/channels would otherwise spam the mod-log with one
+    # entry each; the single "Restore Complete" summary at the end covers it instead.
+    guilds_in_bulk_delete.add(guild.id)
+    try:
+        # Recreate roles first (bottom to top, matches saved order), keep a name -> role object map.
+        # If we're not restoring roles this run, role_map stays empty — channel overwrites that
+        # reference a role by name simply get skipped below (they'll match existing roles by name
+        # if that role already exists in the server from a prior restore).
+        role_map = {}
+        if restore_roles:
+            for role_data in data["roles"]:
+                new_role = await guild.create_role(
+                    name=role_data["name"],
+                    color=discord.Color(role_data["color"]),
+                    permissions=discord.Permissions(role_data["permissions"]),
+                    hoist=role_data["hoist"],
+                    mentionable=role_data["mentionable"],
+                    reason=f"Server restore from backup '{backup_name}' (roles)",
                 )
+                role_map[role_data["name"]] = new_role
+        elif restore_channels:
+            # Channels-only restore: match overwrites against roles that already exist in this
+            # server by name, so a prior roles-only restore (or existing roles) still get wired up.
+            role_map = {role.name: role for role in guild.roles}
 
-            for ow in chan_data.get("overwrites", []):
-                target = guild.default_role if ow["role_name"] == "@everyone" else role_map.get(ow["role_name"])
-                if target is None:
-                    continue
-                overwrite = discord.PermissionOverwrite.from_pair(
-                    discord.Permissions(ow["allow"]), discord.Permissions(ow["deny"])
-                )
-                try:
-                    await new_channel.set_permissions(target, overwrite=overwrite, reason=f"Server restore from backup '{backup_name}' (channels)")
-                except discord.Forbidden:
-                    pass
+        # Recreate categories, keep a name -> object map for channel placement
+        category_map = {}
+        if restore_channels:
+            for cat_data in data["categories"]:
+                cat = await guild.create_category(cat_data["name"], reason=f"Server restore from backup '{backup_name}' (channels)")
+                category_map[cat_data["name"]] = cat
 
-    # Re-assign saved roles to any current member who had one — only relevant when roles were
-    # actually part of this restore.
-    restored_members = 0
-    if restore_roles:
-        for member_id, role_names in data.get("member_roles", {}).items():
-            member = guild.get_member(int(member_id))
-            if member is None:
-                continue  # they're not in the server (anymore/yet) — nothing to restore for them
-            roles_to_add = [role_map[name] for name in role_names if name in role_map]
-            if roles_to_add:
-                try:
-                    await member.add_roles(*roles_to_add, reason=f"Server restore from backup '{backup_name}' (roles)")
-                    restored_members += 1
-                except discord.Forbidden:
-                    pass
+        # Recreate channels into their categories, then re-apply saved permission overwrites
+        if restore_channels:
+            for chan_data in data["channels"]:
+                category = category_map.get(chan_data["category"])
+                if chan_data["type"] == "voice":
+                    new_channel = await guild.create_voice_channel(chan_data["name"], category=category, reason=f"Server restore from backup '{backup_name}' (channels)")
+                else:
+                    new_channel = await guild.create_text_channel(
+                        chan_data["name"], category=category, topic=chan_data.get("topic"),
+                        reason=f"Server restore from backup '{backup_name}' (channels)"
+                    )
+
+                for ow in chan_data.get("overwrites", []):
+                    target = guild.default_role if ow["role_name"] == "@everyone" else role_map.get(ow["role_name"])
+                    if target is None:
+                        continue
+                    overwrite = discord.PermissionOverwrite.from_pair(
+                        discord.Permissions(ow["allow"]), discord.Permissions(ow["deny"])
+                    )
+                    try:
+                        await new_channel.set_permissions(target, overwrite=overwrite, reason=f"Server restore from backup '{backup_name}' (channels)")
+                    except discord.Forbidden:
+                        pass
+
+        # Re-assign saved roles to any current member who had one — only relevant when roles were
+        # actually part of this restore.
+        restored_members = 0
+        if restore_roles:
+            for member_id, role_names in data.get("member_roles", {}).items():
+                member = guild.get_member(int(member_id))
+                if member is None:
+                    continue  # they're not in the server (anymore/yet) — nothing to restore for them
+                roles_to_add = [role_map[name] for name in role_names if name in role_map]
+                if roles_to_add:
+                    try:
+                        await member.add_roles(*roles_to_add, reason=f"Server restore from backup '{backup_name}' (roles)")
+                        restored_members += 1
+                    except discord.Forbidden:
+                        pass
+    finally:
+        guilds_in_bulk_delete.discard(guild.id)
 
     summary_lines = []
     if restore_roles:
