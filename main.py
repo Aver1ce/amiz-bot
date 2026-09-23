@@ -92,11 +92,14 @@ def strip_unicode_lookalikes(text: str) -> str:
 
 def contains_banned_word(text: str, guild_id=None) -> bool:
     text = strip_unicode_lookalikes(text)
-    words = BAD_WORDS
+    words = []
     if guild_id is not None:
-        custom = guild_settings.get(str(guild_id), {}).get("banned_words", [])
-        if custom:
-            words = BAD_WORDS + custom
+        settings = guild_settings.get(str(guild_id), {})
+        if settings.get("global_banned_words_enabled", True):
+            words = list(BAD_WORDS)
+        words = words + settings.get("banned_words", [])
+    else:
+        words = list(BAD_WORDS)
     return any(get_banned_word_pattern(word).search(text) for word in words)
 
 
