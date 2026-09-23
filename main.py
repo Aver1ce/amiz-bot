@@ -2569,7 +2569,11 @@ async def resync_all_level_roles(guild: discord.Guild) -> int:
     for people who already qualify, instead of waiting for their next level-up. Returns how
     many members were actually changed."""
     updated = 0
-    for user_id_str, data in levels_data.get(str(guild.id), {}).items():
+    # list(...) snapshots the items up front — this loop awaits per member (role edits), and
+    # someone chatting elsewhere in the same server mid-loop can add a brand new entry to
+    # this exact dict via grant_xp; iterating the live dict directly risked a genuine
+    # "dictionary changed size during iteration" crash the moment that happened.
+    for user_id_str, data in list(levels_data.get(str(guild.id), {}).items()):
         member = guild.get_member(int(user_id_str))
         if member is None:
             continue
@@ -3544,7 +3548,11 @@ async def check_for_disboard_bump(message: discord.Message):
 async def bump_reminder_check():
     now = datetime.datetime.now(datetime.timezone.utc).timestamp()
     changed = False
-    for guild_id_str, settings in guild_settings.items():
+    # list(...) snapshots this up front — this loop awaits per reminder (a channel send + a
+    # DM), and any other event handler that creates a NEW guild's settings entry mid-loop
+    # (guild_settings.setdefault(...) happens in dozens of places) would otherwise risk a
+    # "dictionary changed size during iteration" crash.
+    for guild_id_str, settings in list(guild_settings.items()):
         reminder = settings.get("bump_reminder")
         if not reminder or reminder.get("sent") or reminder["ready_at"] > now:
             continue
@@ -3797,10 +3805,35 @@ async def timeout_expiry_check():
 # ============================================================
 # MOD COMMANDS
 # ============================================================
+def is_hierarchy_exempt(ctx) -> bool:
+    """True if this invoker bypasses role-hierarchy checks entirely for moderation commands
+    — the bot's creator, or this specific server's actual Discord owner (both already
+    outrank everyone by definition)."""
+    return ctx.author.id == OWNER_ID or ctx.author.id == ctx.guild.owner_id
+
+
+def can_act_on_member(ctx, target: discord.Member) -> bool:
+    """Enforces normal Discord role-hierarchy rules on moderation commands. This matters
+    because Discord's own kick/ban checks hierarchy against the BOT's role, not the invoking
+    moderator's — and our custom timeout system (built on manual role edits, not Discord's
+    native timeout) doesn't check hierarchy at all. Without this, any moderator with the
+    right permission could kick/ban/timeout someone with a higher role than themselves — even
+    the server owner — as long as the bot's own role happened to be high enough. Returns True
+    if ctx.author is allowed to act on target."""
+    if is_hierarchy_exempt(ctx):
+        return True
+    if target.id == ctx.guild.owner_id:
+        return False  # nobody but the owner (already exempted above) touches the actual owner
+    return ctx.author.top_role > target.top_role
+
+
 @bot.hybrid_command()
 @commands.guild_only()
 @has_permissions_or_owner(moderate_members=True)
 async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reason given"):
+    if not can_act_on_member(ctx, member):
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — NOT_ALLOWED", description="You can't timeout someone with a role equal to or higher than yours.", color=discord.Color.red()))
+        return
     await custom_timeout(member, ctx.guild, minutes, reason, moderator=ctx.author)
     await ctx.send(embed=discord.Embed(description=f"🔇 {member.mention} has been timed out for {minutes} minute(s).\nReason: {reason}", color=discord.Color.orange()))
 
@@ -3877,6 +3910,9 @@ async def clearkeyword(ctx, keyword: str, amount: int = 100):
 @commands.guild_only()
 @has_permissions_or_owner(kick_members=True)
 async def kick(ctx, member: discord.Member, *, reason="No reason given"):
+    if not can_act_on_member(ctx, member):
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — NOT_ALLOWED", description="You can't kick someone with a role equal to or higher than yours.", color=discord.Color.red()))
+        return
     dm_note = ""
     try:
         await member.send(embed=discord.Embed(description=f"👢 You were kicked from **{ctx.guild.name}**.\nReason: {reason}", color=discord.Color.red()))
@@ -3891,6 +3927,9 @@ async def kick(ctx, member: discord.Member, *, reason="No reason given"):
 @commands.guild_only()
 @has_permissions_or_owner(ban_members=True)
 async def ban(ctx, member: discord.Member, *, reason="No reason given"):
+    if not can_act_on_member(ctx, member):
+        await ctx.send(embed=discord.Embed(title="⚠️ Error — NOT_ALLOWED", description="You can't ban someone with a role equal to or higher than yours.", color=discord.Color.red()))
+        return
     dm_note = ""
     try:
         await member.send(embed=discord.Embed(description=f"🔨 You were banned from **{ctx.guild.name}**.\nReason: {reason}", color=discord.Color.dark_red()))
